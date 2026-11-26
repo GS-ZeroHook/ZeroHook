@@ -12,7 +12,7 @@ Open **PowerShell as Administrator** and run:
 $p = "$env:TEMP\ZeroHook.ps1"; irm "[https://raw.githubusercontent.com/GS-ZeroHook/ZeroHook/main/ZeroHook.ps1](https://raw.githubusercontent.com/GS-ZeroHook/ZeroHook/main/ZeroHook.ps1)" -OutFile $p; powershell -NoProfile -ExecutionPolicy Bypass -File$p
 ```
 
-*(Prefer a standalone `.exe`? Download `ZeroHook.exe` from the **Releases** page on the right.)*
+*(Prefer a portable `.exe`? Download `ZeroHook.exe` from the **Releases** page on the right.)*
 
 ![ZeroHook Main Interface](assets/preview.png)
 
