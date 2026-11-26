@@ -9,10 +9,12 @@
 Open **PowerShell as Administrator** and run:
 
 ```powershell
-irm "https://raw.githubusercontent.com/GS-ZeroHook/ZeroHook/main/ZeroHook.ps1" | iex
+irm "[https://raw.githubusercontent.com/GS-ZeroHook/ZeroHook/main/ZeroHook.ps1](https://raw.githubusercontent.com/GS-ZeroHook/ZeroHook/main/ZeroHook.ps1)" | iex
 ```
 
 *(Prefer a standalone `.exe`? Download `ZeroHook.exe` from the **Releases** page on the right.)*
+
+![ZeroHook Main Interface](assets/preview.png)
 
 ---
 
@@ -42,10 +44,19 @@ ZeroHook blocks those hook libraries at the OS/permission level so they cannot l
 * **Startup Entries & Shortcuts:** Audits and disables auto-starting registry `Run` entries and Startup folder shortcuts without uninstalling your software.
 * **Scheduled Tasks:** Disables recurring background telemetry and updater tasks in Windows Task Scheduler.
 
-### 3. Real-Time Game DLL Hook & Module Inspector
+### 3. Real-Time Game DLL Hook & Module Inspector (`Live DLL Hooks`)
 * **Loaded Module Scanning:** Inspects running processes and lists loaded DLLs, highlighting known overlays, third-party hooks, unsigned modules, and external injections.
 * **On-Demand Scanning:** Runs only when you trigger a scan—no background polling.
 * **Exclusions Support (`exclusions.json`):** Whitelist trusted DLLs or processes you intentionally run.
+
+---
+
+## How to Undo / Restore Everything
+
+Every change ZeroHook makes is completely reversible:
+1. Open **ZeroHook** (as Administrator).
+2. Click the red **Restore Everything (Default Auto-Start)** button at the top right.
+3. ZeroHook will immediately restore file/ACL permissions on blocked overlay DLLs, re-enable Vulkan implicit layers and Game Bar/DVR settings, restore vendor services/startup items/scheduled tasks to their default auto-start state, and remove the `ZeroHook_AutoBlock` startup task.
 
 ---
 
