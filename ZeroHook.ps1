@@ -22,7 +22,7 @@ $LauncherProcesses = @(
     "CCXProcess", "AdobeIPCBroker", "Creative Cloud"
 )
 
-$SearchPaths = @(
+$BaseSearchPaths = @(
     "${env:ProgramFiles(x86)}\Steam",
     "${env:ProgramFiles(x86)}\Steam\bin",
     "$env:ProgramFiles\Steam",
@@ -48,6 +48,7 @@ $SearchPaths = @(
     "$env:ProgramFiles\NVIDIA Corporation",
     "$env:ProgramData\NVIDIA Corporation",
     "$env:LOCALAPPDATA\NVIDIA Corporation",
+    "$env:SystemRoot\System32",
     "$env:ProgramFiles\AMD",
     "$env:ProgramFiles\Razer",
     "${env:ProgramFiles(x86)}\Razer",
@@ -56,7 +57,8 @@ $SearchPaths = @(
     "${env:ProgramFiles(x86)}\Sony"
 )
 
-$ExcludedPathRegex = "\\steamapps\\|\\Epic Games\\DirectXRedist\\|\\.egstore\\"
+$SearchPaths = @($BaseSearchPaths)
+$ExcludedPathRegex = "\\steamapps\\|\\Epic Games\\DirectXRedist\\|\\.egstore\\|(^|[\\/])WindowsApps([\\/]|$)"
 
 $TargetDLLs = @(
     "GameOverlayRenderer.dll", "GameOverlayRenderer64.dll",
@@ -559,6 +561,10 @@ $LogDir           = Join-Path $env:LOCALAPPDATA "ZeroHook\Logs"
 $DiagLogFile      = Join-Path $LogDir "zerohook-current.log"
 $MaxLogLines      = 1500
 $Script:DiagWriteCount = 0
+$Script:DetectedStoreGames = @()
+$Script:StoreScanCompleted = $false
+$Script:StorePrefixEntries = @()
+$Script:StorePathCache = @{}
 
 function Hide-Username {
     param([string]$Text)
@@ -609,6 +615,926 @@ function Write-DiagnosticLog {
     } catch {}
 }
 
+# --- STORE DETECTION HELPERS ---
+function Normalize-StorePath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return "" }
+    $p = $Path.Trim().Trim('"') -replace '/', '\'
+    if ($p -match '^\\\\\?\\') { $p = $p.Substring(4) }
+    while ($p.Length -gt 3 -and $p.EndsWith('\')) {
+        $p = $p.Substring(0, $p.Length - 1)
+    }
+    return $p
+}
+
+function Ensure-StoreNativeWin32 {
+    if (-not ("ZeroHook.StoreNative" -as [type])) {
+        Add-Type -ErrorAction Stop -TypeDefinition @"
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+namespace ZeroHook {
+    public static class StoreNative {
+        public const uint GENERIC_READ = 0x80000000;
+        public const uint FILE_SHARE_READ = 0x00000001;
+        public const uint FILE_SHARE_WRITE = 0x00000002;
+        public const uint FILE_SHARE_DELETE = 0x00000004;
+        public const uint OPEN_EXISTING = 3;
+        public const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+        public const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern SafeFileHandle CreateFileW(
+            string lpFileName,
+            uint dwDesiredAccess,
+            uint dwShareMode,
+            IntPtr lpSecurityAttributes,
+            uint dwCreationDisposition,
+            uint dwFlagsAndAttributes,
+            IntPtr hTemplateFile
+        );
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint GetFinalPathNameByHandleW(
+            SafeFileHandle hFile,
+            StringBuilder lpszFilePath,
+            uint cchFilePath,
+            uint dwFlags
+        );
+
+        public static string ResolveFinalPath(string path) {
+            if (string.IsNullOrWhiteSpace(path)) return path;
+            try {
+                using (SafeFileHandle h = CreateFileW(
+                    path,
+                    GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    IntPtr.Zero,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    IntPtr.Zero)) {
+                    if (h.IsInvalid) return path;
+                    StringBuilder sb = new StringBuilder(1024);
+                    uint len = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0);
+                    if (len == 0) return path;
+                    if (len >= sb.Capacity) {
+                        sb.EnsureCapacity((int)len + 2);
+                        len = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0);
+                        if (len == 0) return path;
+                    }
+                    string resolved = sb.ToString();
+                    if (resolved.StartsWith(@"\\?\")) {
+                        resolved = resolved.Substring(4);
+                    }
+                    return string.IsNullOrWhiteSpace(resolved) ? path : resolved;
+                }
+            } catch {
+                return path;
+            }
+        }
+    }
+}
+"@
+    }
+}
+
+function Resolve-JunctionTargetPath {
+    param([string]$Path)
+    $clean = Normalize-StorePath $Path
+    if ([string]::IsNullOrWhiteSpace($clean)) { return "" }
+    try {
+        Ensure-StoreNativeWin32
+        $resolved = Normalize-StorePath ([ZeroHook.StoreNative]::ResolveFinalPath($clean))
+        if (-not [string]::IsNullOrWhiteSpace($resolved)) {
+            return $resolved
+        }
+    } catch {}
+    return $clean
+}
+
+function Get-RegistryStringValue {
+    param(
+        [string]$Path,
+        [string[]]$Names
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        $props = Get-ItemProperty -LiteralPath $Path -ErrorAction Stop
+        foreach ($n in $Names) {
+            $val = $props.$n
+            if ($null -ne $val -and -not [string]::IsNullOrWhiteSpace([string]$val)) {
+                return [string]$val
+            }
+        }
+    } catch {}
+    return $null
+}
+
+function Parse-VdfKeyValues {
+    param([string]$Content)
+    $result = @{}
+    if ([string]::IsNullOrWhiteSpace($Content)) { return $result }
+    $lines = $Content -split "`r?`n"
+    foreach ($line in $lines) {
+        $m = [regex]::Match($line.Trim(), '^"([^"]+)"\s+"([^"]*)"')
+        if ($m.Success) {
+            $k = $m.Groups[1].Value.ToLowerInvariant()
+            if (-not $result.ContainsKey($k)) {
+                $result[$k] = $m.Groups[2].Value
+            }
+        }
+    }
+    return $result
+}
+
+function Get-VdfLibraryPaths {
+    param([string]$VdfFilePath)
+    $paths = [System.Collections.Generic.List[string]]::new()
+    if (-not (Test-Path -LiteralPath $VdfFilePath)) { return @() }
+    try {
+        $lines = Get-Content -LiteralPath $VdfFilePath -Encoding UTF8 -ErrorAction Stop
+        foreach ($line in $lines) {
+            $m = [regex]::Match($line.Trim(), '^"path"\s+"([^"]+)"', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            if ($m.Success) {
+                $p = Normalize-StorePath $m.Groups[1].Value
+                if (-not [string]::IsNullOrWhiteSpace($p) -and -not $paths.Contains($p)) {
+                    [void]$paths.Add($p)
+                }
+            }
+        }
+    } catch {}
+    return $paths.ToArray()
+}
+
+function Get-SteamAppNameFromAppInfo {
+    param(
+        [string]$SteamRoot,
+        [string]$AppId
+    )
+    if ([string]::IsNullOrWhiteSpace($SteamRoot) -or [string]::IsNullOrWhiteSpace($AppId)) { return $null }
+    $appInfoPath = Join-Path $SteamRoot "appcache\appinfo.vdf"
+    if (-not (Test-Path -LiteralPath $appInfoPath)) { return $null }
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($appInfoPath)
+        $enc = [System.Text.Encoding]::UTF8
+        $idBytes = [System.BitConverter]::GetBytes([UInt32]$AppId)
+        $pos = 0
+        while ($pos -lt ($bytes.Length - 4)) {
+            if ($bytes[$pos] -eq $idBytes[0] -and $bytes[$pos+1] -eq $idBytes[1] -and $bytes[$pos+2] -eq $idBytes[2] -and $bytes[$pos+3] -eq $idBytes[3]) {
+                $windowStart = [Math]::Max(0, $pos - 64)
+                $windowLen = [Math]::Min($bytes.Length - $windowStart, 8192)
+                $winText = $enc.GetString($bytes, $windowStart, $windowLen)
+                $m = [regex]::Match($winText, 'name\x00([^\x00\r\n]{2,120})\x00')
+                if ($m.Success) {
+                    $candidate = $m.Groups[1].Value.Trim()
+                    if ($candidate -and $candidate -notmatch '^appid_\d+$') {
+                        return $candidate
+                    }
+                }
+            }
+            $pos++
+        }
+    } catch {}
+    return $null
+}
+
+function Get-SteamGames {
+    $games = [System.Collections.Generic.List[object]]::new()
+    $steamPath = Get-RegistryStringValue -Path "HKLM:\SOFTWARE\Valve\Steam" -Names @("SteamPath", "InstallPath")
+    if (-not $steamPath) {
+        $steamPath = Get-RegistryStringValue -Path "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam" -Names @("SteamPath", "InstallPath")
+    }
+    if (-not $steamPath) { return @() }
+    $steamRoot = Normalize-StorePath $steamPath
+    if (-not (Test-Path -LiteralPath $steamRoot)) { return @() }
+
+    $libraries = [System.Collections.Generic.List[string]]::new()
+    [void]$libraries.Add($steamRoot)
+    $libVdf = Join-Path $steamRoot "steamapps\libraryfolders.vdf"
+    foreach ($lib in (Get-VdfLibraryPaths -VdfFilePath $libVdf)) {
+        if (-not $libraries.Contains($lib)) {
+            [void]$libraries.Add($lib)
+        }
+    }
+
+    foreach ($lib in $libraries) {
+        $steamAppsDir = Join-Path $lib "steamapps"
+        if (-not (Test-Path -LiteralPath $steamAppsDir)) { continue }
+        $manifests = Get-ChildItem -Path $steamAppsDir -Filter "appmanifest_*.acf" -File -ErrorAction SilentlyContinue
+        foreach ($mf in $manifests) {
+            try {
+                $raw = Get-Content -LiteralPath $mf.FullName -Raw -Encoding UTF8 -ErrorAction Stop
+                $kv = Parse-VdfKeyValues -Content $raw
+                $installDir = if ($kv.ContainsKey("installdir")) { $kv["installdir"] } else { "" }
+                if ([string]::IsNullOrWhiteSpace($installDir)) { continue }
+                $gamePath = Normalize-StorePath (Join-Path $steamAppsDir "common\$installDir")
+                $appId = if ($kv.ContainsKey("appid")) { $kv["appid"] } elseif ($mf.BaseName -match 'appmanifest_(\d+)') { $matches[1] } else { "" }
+                $name = if ($kv.ContainsKey("name")) { $kv["name"] } else { $installDir }
+                if ($name -match '^appid_\d+$') {
+                    $resolvedName = Get-SteamAppNameFromAppInfo -SteamRoot $steamRoot -AppId $appId
+                    if ($resolvedName) { $name = $resolvedName }
+                }
+                [void]$games.Add([PSCustomObject]@{
+                    Store       = "Steam"
+                    Name        = $name
+                    InstallPath = $gamePath
+                    LaunchUri   = if ($appId) { "steam://rungameid/$appId" } else { "" }
+                    Id          = $appId
+                })
+            } catch {}
+        }
+    }
+    return $games.ToArray()
+}
+
+function Get-EpicGames {
+    $games = [System.Collections.Generic.List[object]]::new()
+
+    $manifestDir = Join-Path $env:ProgramData "Epic\EpicGamesLauncher\Data\Manifests"
+    if (Test-Path -LiteralPath $manifestDir) {
+        $items = Get-ChildItem -Path $manifestDir -Filter "*.item" -File -ErrorAction SilentlyContinue
+        foreach ($it in $items) {
+            try {
+                $json = Get-Content -LiteralPath $it.FullName -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+                $loc = Normalize-StorePath ([string]$json.InstallLocation)
+                if ([string]::IsNullOrWhiteSpace($loc)) { continue }
+                $ns = [string]$json.CatalogNamespace
+                $catId = [string]$json.CatalogItemId
+                $appName = [string]$json.AppName
+                $uri = if ($ns -and $catId -and $appName) {
+                    "com.epicgames.launcher://apps/${ns}%3A${catId}%3A${appName}?action=launch&silent=true"
+                } else { "" }
+                $title = if ($json.DisplayName) { [string]$json.DisplayName } else { Split-Path -Leaf $loc }
+                [void]$games.Add([PSCustomObject]@{
+                    Store       = "Epic"
+                    Name        = $title
+                    InstallPath = $loc
+                    LaunchUri   = $uri
+                    Id          = $appName
+                })
+            } catch {}
+        }
+    }
+
+    $eglv2Jsonl = Join-Path $env:LOCALAPPDATA "com.epicgames.eglv2\installations.jsonl"
+    if (Test-Path -LiteralPath $eglv2Jsonl) {
+        $catalogCachePath = Join-Path $env:LOCALAPPDATA "com.epicgames.eglv2\cache\prod\catalog-cache.json"
+        $catalogItems = $null
+        if (Test-Path -LiteralPath $catalogCachePath) {
+            try {
+                $catObj = Get-Content -LiteralPath $catalogCachePath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+                if ($catObj -and $catObj.items) { $catalogItems = $catObj.items }
+            } catch {}
+        }
+
+        try {
+            $lines = @(Get-Content -LiteralPath $eglv2Jsonl -Encoding UTF8 -ErrorAction Stop)
+            $latestByInstallId = @{}
+            for ($i = 1; $i -lt $lines.Count; $i++) {
+                $line = $lines[$i].Trim()
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                try {
+                    $ev = $line | ConvertFrom-Json
+                    if ($ev.installationId) {
+                        $latestByInstallId[[string]$ev.installationId] = $ev
+                    }
+                } catch {}
+            }
+
+            foreach ($kvp in $latestByInstallId.GetEnumerator()) {
+                $ev = $kvp.Value
+                if (-not [bool]$ev.complete) { continue }
+                $loc = Normalize-StorePath ([string]$ev.installLocation)
+                if ([string]::IsNullOrWhiteSpace($loc)) { continue }
+
+                $artifactId = [string]$ev.artifactId
+                $itemId = [string]$ev.itemId
+                $name = ""
+
+                if ($artifactId) {
+                    $uninstKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\EpicGames-$artifactId"
+                    $name = Get-RegistryStringValue -Path $uninstKey -Names @("DisplayName")
+                }
+
+                if ([string]::IsNullOrWhiteSpace($name) -and $catalogItems -and $itemId) {
+                    $entry = $catalogItems.PSObject.Properties[$itemId].Value
+                    if ($entry -and $entry.item) {
+                        $mainGameId = if ($entry.item.mainGameItem -and $entry.item.mainGameItem.id) { [string]$entry.item.mainGameItem.id } else { "" }
+                        if ($mainGameId) {
+                            $parentEntry = $catalogItems.PSObject.Properties[$mainGameId].Value
+                            if ($parentEntry -and $parentEntry.item -and $parentEntry.item.title) {
+                                $name = [string]$parentEntry.item.title
+                            }
+                        }
+                        if ([string]::IsNullOrWhiteSpace($name) -and $entry.item.title) {
+                            $name = [string]$entry.item.title
+                        }
+                    }
+                }
+
+                if ([string]::IsNullOrWhiteSpace($name)) {
+                    $name = Split-Path -Leaf $loc
+                }
+
+                [void]$games.Add([PSCustomObject]@{
+                    Store       = "Epic"
+                    Name        = $name
+                    InstallPath = $loc
+                    LaunchUri   = ""
+                    Id          = if ($artifactId) { $artifactId } else { $itemId }
+                })
+            }
+        } catch {}
+    }
+
+    return $games.ToArray()
+}
+
+function Get-GogGames {
+    $games = [System.Collections.Generic.List[object]]::new()
+    $regRoots = @(
+        "HKLM:\SOFTWARE\GOG.com\Games",
+        "HKLM:\SOFTWARE\WOW6432Node\GOG.com\Games"
+    )
+    foreach ($root in $regRoots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $subKeys = Get-ChildItem -Path $root -ErrorAction SilentlyContinue
+        foreach ($sk in $subKeys) {
+            $pathVal = Get-RegistryStringValue -Path $sk.PSPath -Names @("PATH", "path")
+            $loc = Normalize-StorePath $pathVal
+            if ([string]::IsNullOrWhiteSpace($loc)) { continue }
+            $nameVal = Get-RegistryStringValue -Path $sk.PSPath -Names @("GAMENAME", "GameName")
+            if ([string]::IsNullOrWhiteSpace($nameVal)) { $nameVal = Split-Path -Leaf $loc }
+            [void]$games.Add([PSCustomObject]@{
+                Store       = "GOG"
+                Name        = $nameVal
+                InstallPath = $loc
+                LaunchUri   = ""
+                Id          = $sk.PSChildName
+            })
+        }
+    }
+    return $games.ToArray()
+}
+
+function Get-EaGames {
+    $games = [System.Collections.Generic.List[object]]::new()
+
+    $eaContentDir = Join-Path $env:ProgramData "EA\content"
+    if (Test-Path -LiteralPath $eaContentDir) {
+        $xmls = Get-ChildItem -Path $eaContentDir -Filter "installerdata.xml" -Recurse -File -ErrorAction SilentlyContinue
+        foreach ($xf in $xmls) {
+            try {
+                [xml]$doc = Get-Content -LiteralPath $xf.FullName -Raw -ErrorAction Stop
+                $gameName = [string]$doc.SelectSingleNode("//gameName").'#text'
+                $installPath = Normalize-StorePath ([string]$doc.SelectSingleNode("//defaultInstallPath").'#text')
+                if (-not [string]::IsNullOrWhiteSpace($installPath)) {
+                    [void]$games.Add([PSCustomObject]@{
+                        Store       = "EA"
+                        Name        = if ($gameName) { $gameName } else { Split-Path -Leaf $installPath }
+                        InstallPath = $installPath
+                        LaunchUri   = ""
+                        Id          = $xf.Directory.Parent.Name
+                    })
+                }
+            } catch {}
+        }
+    }
+
+    $originRoot = "HKLM:\SOFTWARE\Wow6432Node\Origin Games"
+    if (Test-Path -LiteralPath $originRoot) {
+        foreach ($sk in (Get-ChildItem -Path $originRoot -ErrorAction SilentlyContinue)) {
+            $loc = Normalize-StorePath (Get-RegistryStringValue -Path $sk.PSPath -Names @("InstallDir", "Install Dir"))
+            if (-not [string]::IsNullOrWhiteSpace($loc)) {
+                $disp = Get-RegistryStringValue -Path $sk.PSPath -Names @("DisplayName")
+                [void]$games.Add([PSCustomObject]@{
+                    Store       = "EA"
+                    Name        = if ($disp) { $disp } else { Split-Path -Leaf $loc }
+                    InstallPath = $loc
+                    LaunchUri   = ""
+                    Id          = $sk.PSChildName
+                })
+            }
+        }
+    }
+
+    $studioNames = @("EA Games", "Electronic Arts", "BioWare", "DICE", "Respawn", "Criterion Games", "Ghost Games", "PopCap")
+    $regPrefixes = @("HKLM:\SOFTWARE", "HKLM:\SOFTWARE\Wow6432Node")
+    foreach ($pref in $regPrefixes) {
+        foreach ($st in $studioNames) {
+            $stPath = Join-Path $pref $st
+            if (-not (Test-Path -LiteralPath $stPath)) { continue }
+            $directLoc = Normalize-StorePath (Get-RegistryStringValue -Path $stPath -Names @("Install Dir", "InstallDir", "Install Directory"))
+            if (-not [string]::IsNullOrWhiteSpace($directLoc)) {
+                [void]$games.Add([PSCustomObject]@{
+                    Store       = "EA"
+                    Name        = Split-Path -Leaf $directLoc
+                    InstallPath = $directLoc
+                    LaunchUri   = ""
+                    Id          = $st
+                })
+            }
+            foreach ($sub in (Get-ChildItem -Path $stPath -Recurse -ErrorAction SilentlyContinue)) {
+                $subLoc = Normalize-StorePath (Get-RegistryStringValue -Path $sub.PSPath -Names @("Install Dir", "InstallDir", "Install Directory"))
+                if (-not [string]::IsNullOrWhiteSpace($subLoc)) {
+                    $subName = Get-RegistryStringValue -Path $sub.PSPath -Names @("DisplayName")
+                    if ([string]::IsNullOrWhiteSpace($subName)) { $subName = Split-Path -Leaf $subLoc }
+                    [void]$games.Add([PSCustomObject]@{
+                        Store       = "EA"
+                        Name        = $subName
+                        InstallPath = $subLoc
+                        LaunchUri   = ""
+                        Id          = $sub.PSChildName
+                    })
+                }
+            }
+        }
+    }
+
+    $eaFolders = @("${env:ProgramFiles}\EA Games", "${env:ProgramFiles(x86)}\EA Games") | Select-Object -Unique
+    foreach ($ef in $eaFolders) {
+        if (-not (Test-Path -LiteralPath $ef)) { continue }
+        foreach ($dir in (Get-ChildItem -Path $ef -Directory -ErrorAction SilentlyContinue)) {
+            $topExe = Get-ChildItem -Path $dir.FullName -Filter "*.exe" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($topExe) {
+                $loc = Normalize-StorePath $dir.FullName
+                [void]$games.Add([PSCustomObject]@{
+                    Store       = "EA"
+                    Name        = $dir.Name
+                    InstallPath = $loc
+                    LaunchUri   = ""
+                    Id          = $dir.Name
+                })
+            }
+        }
+    }
+
+    $eaAppData = Join-Path $env:LOCALAPPDATA "Electronic Arts\EA Desktop"
+    if (Test-Path -LiteralPath $eaAppData) {
+        $cfgFiles = Get-ChildItem -Path $eaAppData -Include "*.ini", "*.json" -Recurse -File -ErrorAction SilentlyContinue
+        foreach ($cf in $cfgFiles) {
+            try {
+                $txt = Get-Content -LiteralPath $cf.FullName -Raw -ErrorAction Stop
+                $matches = [regex]::Matches($txt, '[A-Za-z]:[\\/][^\r\n"\'']+')
+                foreach ($m in $matches) {
+                    $cand = Normalize-StorePath $m.Value
+                    if ($cand -and (Test-Path -LiteralPath $cand)) {
+                        $xmlCand = Join-Path $cand "__Installer\installerdata.xml"
+                        if (Test-Path -LiteralPath $xmlCand) {
+                            [xml]$doc = Get-Content -LiteralPath $xmlCand -Raw -ErrorAction Stop
+                            $gName = [string]$doc.SelectSingleNode("//gameName").'#text'
+                            $gPath = Normalize-StorePath ([string]$doc.SelectSingleNode("//defaultInstallPath").'#text')
+                            if ([string]::IsNullOrWhiteSpace($gPath)) { $gPath = $cand }
+                            [void]$games.Add([PSCustomObject]@{
+                                Store       = "EA"
+                                Name        = if ($gName) { $gName } else { Split-Path -Leaf $gPath }
+                                InstallPath = $gPath
+                                LaunchUri   = ""
+                                Id          = Split-Path -Leaf $gPath
+                            })
+                        }
+                    }
+                }
+            } catch {}
+        }
+    }
+
+    return $games.ToArray()
+}
+
+function Get-UbisoftGames {
+    $games = [System.Collections.Generic.List[object]]::new()
+
+    $ubiRegPaths = @(
+        "HKLM:\SOFTWARE\Ubisoft\Launcher\Installs",
+        "HKLM:\SOFTWARE\WOW6432Node\Ubisoft\Launcher\Installs"
+    )
+    foreach ($rp in $ubiRegPaths) {
+        if (-not (Test-Path -LiteralPath $rp)) { continue }
+        foreach ($sk in (Get-ChildItem -Path $rp -ErrorAction SilentlyContinue)) {
+            $loc = Normalize-StorePath (Get-RegistryStringValue -Path $sk.PSPath -Names @("InstallDir"))
+            if (-not [string]::IsNullOrWhiteSpace($loc)) {
+                $folderName = Split-Path -Leaf $loc
+                [void]$games.Add([PSCustomObject]@{
+                    Store       = "Ubisoft"
+                    Name        = $folderName
+                    InstallPath = $loc
+                    LaunchUri   = if ($sk.PSChildName -match '^\d+$') { "uplay://launch/$($sk.PSChildName)/0" } else { "" }
+                    Id          = $sk.PSChildName
+                })
+            }
+        }
+    }
+
+    $settingsYml = Join-Path $env:LOCALAPPDATA "Ubisoft Game Launcher\settings.yml"
+    if (Test-Path -LiteralPath $settingsYml) {
+        try {
+            $lines = Get-Content -LiteralPath $settingsYml -Encoding UTF8 -ErrorAction Stop
+            foreach ($line in $lines) {
+                if ($line -match '^\s*game_installation_path\s*:\s*(.+)$') {
+                    $rootDir = Normalize-StorePath $matches[1]
+                    if ($rootDir -and (Test-Path -LiteralPath $rootDir)) {
+                        foreach ($sub in (Get-ChildItem -Path $rootDir -Directory -ErrorAction SilentlyContinue)) {
+                            $loc = Normalize-StorePath $sub.FullName
+                            [void]$games.Add([PSCustomObject]@{
+                                Store       = "Ubisoft"
+                                Name        = $sub.Name
+                                InstallPath = $loc
+                                LaunchUri   = ""
+                                Id          = $sub.Name
+                            })
+                        }
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    $ubiDefaults = @(
+        "${env:ProgramFiles(x86)}\Ubisoft\Ubisoft Game Launcher\games",
+        "${env:ProgramFiles}\Ubisoft\Ubisoft Game Launcher\games"
+    ) | Select-Object -Unique
+    foreach ($ud in $ubiDefaults) {
+        if (-not (Test-Path -LiteralPath $ud)) { continue }
+        foreach ($sub in (Get-ChildItem -Path $ud -Directory -ErrorAction SilentlyContinue)) {
+            $loc = Normalize-StorePath $sub.FullName
+            [void]$games.Add([PSCustomObject]@{
+                Store       = "Ubisoft"
+                Name        = $sub.Name
+                InstallPath = $loc
+                LaunchUri   = ""
+                Id          = $sub.Name
+            })
+        }
+    }
+
+    return $games.ToArray()
+}
+
+function Get-BattleNetGames {
+    $games = [System.Collections.Generic.List[object]]::new()
+    $targetPublishers = @("Blizzard Entertainment", "Activision", "Activision Blizzard")
+
+    $uninstRoots = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
+    foreach ($ur in $uninstRoots) {
+        if (-not (Test-Path -LiteralPath $ur)) { continue }
+        foreach ($sk in (Get-ChildItem -Path $ur -ErrorAction SilentlyContinue)) {
+            $pub = Get-RegistryStringValue -Path $sk.PSPath -Names @("Publisher")
+            if (-not $pub -or ($pub -notin $targetPublishers)) { continue }
+            $disp = Get-RegistryStringValue -Path $sk.PSPath -Names @("DisplayName")
+            if ($disp -and ($disp -match '(?i)Battle\.net') -and ($disp -notmatch '(?i)\bgame\b')) { continue }
+            $loc = Normalize-StorePath (Get-RegistryStringValue -Path $sk.PSPath -Names @("InstallLocation"))
+            if (-not [string]::IsNullOrWhiteSpace($loc)) {
+                [void]$games.Add([PSCustomObject]@{
+                    Store       = "Battle.net"
+                    Name        = if ($disp) { $disp } else { Split-Path -Leaf $loc }
+                    InstallPath = $loc
+                    LaunchUri   = ""
+                    Id          = $sk.PSChildName
+                })
+            }
+        }
+    }
+
+    $bnetCfg = Join-Path $env:APPDATA "Battle.net\Battle.net.config"
+    if (Test-Path -LiteralPath $bnetCfg) {
+        try {
+            $cfgObj = Get-Content -LiteralPath $bnetCfg -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+            $defPath = $null
+            if ($cfgObj.Client -and $cfgObj.Client.Install -and $cfgObj.Client.Install.DefaultInstallPath) {
+                $defPath = Normalize-StorePath ([string]$cfgObj.Client.Install.DefaultInstallPath)
+            }
+            if ($defPath -and (Test-Path -LiteralPath $defPath)) {
+                foreach ($sub in (Get-ChildItem -Path $defPath -Directory -ErrorAction SilentlyContinue)) {
+                    $hasExe = Get-ChildItem -Path $sub.FullName -Filter "*.exe" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($hasExe) {
+                        [void]$games.Add([PSCustomObject]@{
+                            Store       = "Battle.net"
+                            Name        = $sub.Name
+                            InstallPath = (Normalize-StorePath $sub.FullName)
+                            LaunchUri   = ""
+                            Id          = $sub.Name
+                        })
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    $bnetDefaults = @(
+        "${env:ProgramFiles(x86)}\Battle.net",
+        "${env:ProgramFiles}\Battle.net",
+        "${env:ProgramFiles(x86)}\Blizzard Entertainment",
+        "${env:ProgramFiles}\Blizzard Entertainment"
+    ) | Select-Object -Unique
+    foreach ($bd in $bnetDefaults) {
+        if (-not (Test-Path -LiteralPath $bd)) { continue }
+        foreach ($sub in (Get-ChildItem -Path $bd -Directory -ErrorAction SilentlyContinue)) {
+            if ($sub.Name -match '^(Battle\.net|Blizzard Battle\.net)$') { continue }
+            $hasExe = Get-ChildItem -Path $sub.FullName -Filter "*.exe" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hasExe) {
+                [void]$games.Add([PSCustomObject]@{
+                    Store       = "Battle.net"
+                    Name        = $sub.Name
+                    InstallPath = (Normalize-StorePath $sub.FullName)
+                    LaunchUri   = ""
+                    Id          = $sub.Name
+                })
+            }
+        }
+    }
+
+    return $games.ToArray()
+}
+
+function Get-RockstarGames {
+    $games = [System.Collections.Generic.List[object]]::new()
+
+    $uninstRoots = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
+    foreach ($ur in $uninstRoots) {
+        if (-not (Test-Path -LiteralPath $ur)) { continue }
+        foreach ($sk in (Get-ChildItem -Path $ur -ErrorAction SilentlyContinue)) {
+            $pub = Get-RegistryStringValue -Path $sk.PSPath -Names @("Publisher")
+            if (-not $pub -or ($pub -notmatch '(?i)Rockstar')) { continue }
+            $disp = Get-RegistryStringValue -Path $sk.PSPath -Names @("DisplayName")
+            if ($disp -and ($disp -match '(?i)Launcher') -and ($disp -match '(?i)Rockstar') -and ($disp -notmatch '(?i)Grand')) { continue }
+            $loc = Normalize-StorePath (Get-RegistryStringValue -Path $sk.PSPath -Names @("InstallLocation"))
+            if (-not [string]::IsNullOrWhiteSpace($loc)) {
+                [void]$games.Add([PSCustomObject]@{
+                    Store       = "Rockstar"
+                    Name        = if ($disp) { $disp } else { Split-Path -Leaf $loc }
+                    InstallPath = $loc
+                    LaunchUri   = ""
+                    Id          = $sk.PSChildName
+                })
+            }
+        }
+    }
+
+    $rstarRegPaths = @(
+        "HKLM:\SOFTWARE\Rockstar Games\Launcher",
+        "HKLM:\SOFTWARE\WOW6432Node\Rockstar Games\Launcher",
+        "HKLM:\SOFTWARE\Rockstar Games\Rockstar Games Launcher",
+        "HKLM:\SOFTWARE\WOW6432Node\Rockstar Games\Rockstar Games Launcher"
+    )
+    foreach ($rr in $rstarRegPaths) {
+        $launcherFolder = Normalize-StorePath (Get-RegistryStringValue -Path $rr -Names @("InstallFolder", "InstallDir"))
+        if ($launcherFolder) {
+            $titlesDat = Join-Path $launcherFolder "titles.dat"
+            if (Test-Path -LiteralPath $titlesDat) {
+                try {
+                    $raw = Get-Content -LiteralPath $titlesDat -Raw -Encoding UTF8 -ErrorAction Stop
+                    $pathMatches = [regex]::Matches($raw, '"InstallFolder"\s*:\s*"([^"]+)"')
+                    foreach ($pm in $pathMatches) {
+                        $tLoc = Normalize-StorePath $pm.Groups[1].Value
+                        if (-not [string]::IsNullOrWhiteSpace($tLoc)) {
+                            [void]$games.Add([PSCustomObject]@{
+                                Store       = "Rockstar"
+                                Name        = Split-Path -Leaf $tLoc
+                                InstallPath = $tLoc
+                                LaunchUri   = ""
+                                Id          = Split-Path -Leaf $tLoc
+                            })
+                        }
+                    }
+                } catch {}
+            }
+        }
+    }
+
+    $rstarDefaults = @("${env:ProgramFiles}\Rockstar Games", "${env:ProgramFiles(x86)}\Rockstar Games") | Select-Object -Unique
+    foreach ($rd in $rstarDefaults) {
+        if (-not (Test-Path -LiteralPath $rd)) { continue }
+        foreach ($sub in (Get-ChildItem -Path $rd -Directory -ErrorAction SilentlyContinue)) {
+            if ($sub.Name -match '(?i)^Rockstar Games Launcher$') { continue }
+            [void]$games.Add([PSCustomObject]@{
+                Store       = "Rockstar"
+                Name        = $sub.Name
+                InstallPath = (Normalize-StorePath $sub.FullName)
+                LaunchUri   = ""
+                Id          = $sub.Name
+            })
+        }
+    }
+
+    return $games.ToArray()
+}
+
+function Get-XboxGames {
+    $games = [System.Collections.Generic.List[object]]::new()
+
+    $registeredFullNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $repoRoot = "HKLM:\SOFTWARE\Microsoft\GamingServices\PackageRepository\Root"
+    if (Test-Path -LiteralPath $repoRoot) {
+        try {
+            $props = Get-ItemProperty -LiteralPath $repoRoot -ErrorAction SilentlyContinue
+            if ($props) {
+                foreach ($p in $props.PSObject.Properties) {
+                    if ($p.Name -notin @("PSPath", "PSParentPath", "PSChildName", "PSDrive", "PSProvider")) {
+                        [void]$registeredFullNames.Add([string]$p.Name)
+                    }
+                }
+            }
+            foreach ($sk in (Get-ChildItem -Path $repoRoot -Recurse -ErrorAction SilentlyContinue)) {
+                $pkgFull = Get-RegistryStringValue -Path $sk.PSPath -Names @("PackageFullName")
+                if ($pkgFull) { [void]$registeredFullNames.Add($pkgFull) }
+                if ($sk.PSChildName -match '_') { [void]$registeredFullNames.Add($sk.PSChildName) }
+            }
+        } catch {}
+    }
+
+    try {
+        $null = [Windows.Management.Deployment.PackageManager, Windows.Management.Deployment, ContentType = WindowsRuntime]
+        $pm = New-Object Windows.Management.Deployment.PackageManager
+        $pkgs = $pm.FindPackagesForUser("")
+
+        foreach ($pkg in $pkgs) {
+            try {
+                if ($pkg.IsFramework -or $pkg.IsResourcePackage -or $pkg.IsBundle) { continue }
+                $sigKind = [string]$pkg.SignatureKind
+                if ($sigKind -and ($sigKind -notmatch 'Store')) { continue }
+
+                $fullName = [string]$pkg.Id.FullName
+                $rawPath = ""
+                try { $rawPath = Normalize-StorePath ([string]$pkg.InstalledLocation.Path) } catch {}
+                if ([string]::IsNullOrWhiteSpace($rawPath)) { continue }
+
+                $resolvedPath = Resolve-JunctionTargetPath -Path $rawPath
+                $finalPath = if ($resolvedPath -and ($resolvedPath -notmatch '(?i)[\\/]WindowsApps([\\/]|$)')) {
+                    $resolvedPath
+                } else {
+                    $rawPath
+                }
+
+                $hasGameConfig = $false
+                if ($finalPath -and ($finalPath -notmatch '(?i)[\\/]WindowsApps([\\/]|$)') -and (Test-Path -LiteralPath $finalPath)) {
+                    $hasGameConfig = Test-Path -LiteralPath (Join-Path $finalPath "MicrosoftGame.config") -ErrorAction SilentlyContinue
+                }
+
+                if (-not ($registeredFullNames.Contains($fullName) -or $hasGameConfig)) { continue }
+
+                $dispName = [string]$pkg.DisplayName
+                if ([string]::IsNullOrWhiteSpace($dispName)) { $dispName = [string]$pkg.Id.Name }
+
+                $aumid = ""
+                try {
+                    $appListEntries = $pkg.GetAppListEntries()
+                    if ($appListEntries -and $appListEntries.Count -gt 0) {
+                        $aumid = [string]$appListEntries[0].AppUserModelId
+                    }
+                } catch {}
+
+                [void]$games.Add([PSCustomObject]@{
+                    Store       = "Xbox"
+                    Name        = $dispName
+                    InstallPath = $finalPath
+                    LaunchUri   = if ($aumid) { "shell:AppsFolder\$aumid" } else { "" }
+                    Id          = $fullName
+                })
+            } catch {}
+        }
+    } catch {
+        Write-DiagnosticLog -Level "WARN" -Source "STORE" -Message "Xbox PackageManager scan skipped/failed: $($_.Exception.Message)"
+    }
+
+    return $games.ToArray()
+}
+
+function Rebuild-StorePathIndex {
+    $Script:StorePathCache = @{}
+    $entries = [System.Collections.Generic.List[object]]::new()
+    foreach ($g in $Script:DetectedStoreGames) {
+        if ($g -and -not [string]::IsNullOrWhiteSpace($g.InstallPath)) {
+            $norm = Normalize-StorePath $g.InstallPath
+            if (-not [string]::IsNullOrWhiteSpace($norm)) {
+                [void]$entries.Add([PSCustomObject]@{
+                    Store  = [string]$g.Store
+                    Exact  = $norm
+                    Prefix = ($norm.TrimEnd('\') + '\')
+                    Length = $norm.Length
+                })
+            }
+        }
+    }
+    $Script:StorePrefixEntries = @($entries | Sort-Object Length -Descending)
+}
+
+function Get-InstalledStoreGames {
+    param([switch]$Refresh)
+    if (-not $Refresh -and $Script:StoreScanCompleted) {
+        return $Script:DetectedStoreGames
+    }
+
+    $allRaw = [System.Collections.Generic.List[object]]::new()
+    $steamExtraPaths = [System.Collections.Generic.List[string]]::new()
+
+    $steamPath = Get-RegistryStringValue -Path "HKLM:\SOFTWARE\Valve\Steam" -Names @("SteamPath", "InstallPath")
+    if (-not $steamPath) {
+        $steamPath = Get-RegistryStringValue -Path "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam" -Names @("SteamPath", "InstallPath")
+    }
+    if ($steamPath) {
+        $steamRoot = Normalize-StorePath $steamPath
+        if ($steamRoot -and (Test-Path -LiteralPath $steamRoot)) {
+            [void]$steamExtraPaths.Add($steamRoot)
+            $steamBin = Join-Path $steamRoot "bin"
+            if (Test-Path -LiteralPath $steamBin) { [void]$steamExtraPaths.Add($steamBin) }
+            $libVdf = Join-Path $steamRoot "steamapps\libraryfolders.vdf"
+            foreach ($lib in (Get-VdfLibraryPaths -VdfFilePath $libVdf)) {
+                [void]$steamExtraPaths.Add($lib)
+                $libBin = Join-Path $lib "bin"
+                if (Test-Path -LiteralPath $libBin) { [void]$steamExtraPaths.Add($libBin) }
+            }
+        }
+    }
+
+    foreach ($fn in @(
+        { Get-SteamGames },
+        { Get-EpicGames },
+        { Get-GogGames },
+        { Get-EaGames },
+        { Get-UbisoftGames },
+        { Get-BattleNetGames },
+        { Get-RockstarGames },
+        { Get-XboxGames }
+    )) {
+        try {
+            $res = & $fn
+            if ($res) {
+                foreach ($item in $res) {
+                    if ($item -and -not [string]::IsNullOrWhiteSpace($item.InstallPath)) {
+                        $item.InstallPath = Normalize-StorePath $item.InstallPath
+                        [void]$allRaw.Add($item)
+                    }
+                }
+            }
+        } catch {
+            Write-DiagnosticLog -Level "WARN" -Source "STORE" -Message "Store detector error: $($_.Exception.Message)"
+        }
+    }
+
+    $seenPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $deduped = [System.Collections.Generic.List[object]]::new()
+    foreach ($g in $allRaw) {
+        $key = "$($g.Store)|$($g.InstallPath)"
+        if ($seenPaths.Add($key)) {
+            [void]$deduped.Add($g)
+        }
+    }
+
+    $Script:DetectedStoreGames = @($deduped | Sort-Object Store, Name, InstallPath)
+    Rebuild-StorePathIndex
+
+    $extraPaths = [System.Collections.Generic.List[string]]::new()
+    foreach ($p in $BaseSearchPaths) {
+        $normP = Normalize-StorePath $p
+        if (-not [string]::IsNullOrWhiteSpace($normP) -and -not $extraPaths.Contains($normP)) {
+            [void]$extraPaths.Add($normP)
+        }
+    }
+    foreach ($sp in $steamExtraPaths) {
+        $normSp = Normalize-StorePath $sp
+        if (-not [string]::IsNullOrWhiteSpace($normSp) -and -not $extraPaths.Contains($normSp)) {
+            [void]$extraPaths.Add($normSp)
+        }
+    }
+    $Script:SearchPaths = $extraPaths.ToArray()
+    $script:SearchPaths = $Script:SearchPaths
+    $Script:StoreScanCompleted = $true
+
+    return $Script:DetectedStoreGames
+}
+
+function Get-StoreForPath {
+    param([string]$FilePath)
+    $normFile = Normalize-StorePath $FilePath
+    if ([string]::IsNullOrWhiteSpace($normFile)) { return $null }
+    if ($Script:StorePathCache.ContainsKey($normFile)) {
+        return $Script:StorePathCache[$normFile]
+    }
+    if (-not $Script:StoreScanCompleted) {
+        $null = Get-InstalledStoreGames
+    }
+    $matchedStore = $null
+    foreach ($entry in $Script:StorePrefixEntries) {
+        if ($normFile.StartsWith($entry.Prefix, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $normFile.Equals($entry.Exact, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $matchedStore = $entry.Store
+            break
+        }
+    }
+    $Script:StorePathCache[$normFile] = $matchedStore
+    return $matchedStore
+}
+
 function Copy-BugReportToClipboard {
     param(
         [string]$FallbackTitle = "ZeroHook Diagnostic Log"
@@ -637,7 +1563,7 @@ function Copy-BugReportToClipboard {
 
     $report = @(
         "=== ZeroHook Bug Report ==="
-        "App: ZeroHook (Made by: GS | Build: v.1.0.0)"
+        "App: ZeroHook (Made by: GS | Build: v.1.0.1)"
         "Section: $FallbackTitle"
         "Timestamp (UTC): $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'))Z"
         "OS: $osInfo"
@@ -732,20 +1658,61 @@ function Get-RunningLaunchers {
 }
 
 function Get-OverlayDLLs {
-    $Found = @()
-    foreach ($BasePath in $SearchPaths) {
-        if (Test-Path $BasePath) {
-            if ($BasePath -like "*\Steam") {
-                $Found += Get-ChildItem -Path $BasePath -File -ErrorAction SilentlyContinue |
-                    Where-Object { $TargetDLLs -contains $_.Name }
-            } else {
-                $Found += Get-ChildItem -Path $BasePath -Recurse -File -ErrorAction SilentlyContinue |
-                    Where-Object { ($TargetDLLs -contains $_.Name) -and ($_.FullName -notmatch $ExcludedPathRegex) }
+    if (-not $Script:StoreScanCompleted) {
+        $null = Get-InstalledStoreGames
+    }
+    $Found = [System.Collections.Generic.List[object]]::new()
+    $seenFull = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $sys32Path = Normalize-StorePath "$env:SystemRoot\System32"
+    $sysWow64Path = Normalize-StorePath "$env:SystemRoot\SysWOW64"
+    $targetNameSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($td in $TargetDLLs) { [void]$targetNameSet.Add($td) }
+
+    $addFile = {
+        param($fileObj)
+        if ($fileObj -and $seenFull.Add($fileObj.FullName)) {
+            [void]$Found.Add($fileObj)
+        }
+    }
+
+    foreach ($BasePath in $Script:SearchPaths) {
+        $normBase = Normalize-StorePath $BasePath
+        if (-not $normBase -or ($normBase -match '(?i)[\\/]WindowsApps([\\/]|$)')) { continue }
+        if (-not (Test-Path -LiteralPath $normBase)) { continue }
+
+        if ($normBase -ieq $sys32Path) {
+            $nv64 = Join-Path $normBase "nvspcap64.dll"
+            if (Test-Path -LiteralPath $nv64) {
+                & $addFile (Get-Item -LiteralPath $nv64 -ErrorAction SilentlyContinue)
+            }
+            if (Test-Path -LiteralPath $sysWow64Path) {
+                $nv32 = Join-Path $sysWow64Path "nvspcap.dll"
+                if (Test-Path -LiteralPath $nv32) {
+                    & $addFile (Get-Item -LiteralPath $nv32 -ErrorAction SilentlyContinue)
+                }
+            }
+        } elseif ((Split-Path -Leaf $normBase) -ieq "Steam" -or $normBase -like "*\Steam") {
+            foreach ($f in (Get-ChildItem -LiteralPath $normBase -File -ErrorAction SilentlyContinue)) {
+                if ($targetNameSet.Contains($f.Name)) { & $addFile $f }
+            }
+            $steamBin = Join-Path $normBase "bin"
+            if (Test-Path -LiteralPath $steamBin) {
+                foreach ($f in (Get-ChildItem -Path $steamBin -Recurse -File -ErrorAction SilentlyContinue)) {
+                    if ($targetNameSet.Contains($f.Name) -and ($f.FullName -notmatch $ExcludedPathRegex)) {
+                        & $addFile $f
+                    }
+                }
+            }
+        } else {
+            foreach ($f in (Get-ChildItem -Path $normBase -Recurse -File -ErrorAction SilentlyContinue)) {
+                if ($targetNameSet.Contains($f.Name) -and ($f.FullName -notmatch $ExcludedPathRegex)) {
+                    & $addFile $f
+                }
             }
         }
     }
-    $Found = @($Found | Sort-Object FullName -Unique)
-    $Results = @()
+
+    $Results = [System.Collections.Generic.List[object]]::new()
     foreach ($F in $Found) {
         $IsBlocked = $false
         $Acl = Get-Acl -Path $F.FullName -ErrorAction SilentlyContinue
@@ -754,9 +1721,10 @@ function Get-OverlayDLLs {
                 if (Test-IsEveryoneDenyRule $R) { $IsBlocked = $true; break }
             }
         }
-        $Results += [PSCustomObject]@{ Name = $F.Name; FullName = $F.FullName; IsBlocked = $IsBlocked }
+        $storeName = Get-StoreForPath -FilePath $F.FullName
+        [void]$Results.Add([PSCustomObject]@{ Name = $F.Name; FullName = $F.FullName; IsBlocked = $IsBlocked; Store = $storeName })
     }
-    return $Results
+    return $Results.ToArray()
 }
 
 function Get-VulkanLayersList {
@@ -919,6 +1887,9 @@ function Get-LiveHookFeatureKey {
 
 function Get-ProcessHookSnapshot {
     param([int]$TargetPid, $ExpectedStartUtc = $null, [string]$GamePath = "")
+    if (-not $Script:StoreScanCompleted) {
+        $null = Get-InstalledStoreGames
+    }
     $byFeature = @{}
     $allModules = [System.Collections.Generic.List[object]]::new()
     $state = "PASS"
@@ -940,10 +1911,14 @@ function Get-ProcessHookSnapshot {
         foreach ($m in $modules) {
             $modName = [string]$m.ModuleName
             $modPath = [string]$m.FileName
+            $storeTag = Get-StoreForPath -FilePath $modPath
+            $baseDesc = Get-LiveHookDllDescription -ModuleName $modName
+            $fullDesc = if ($storeTag -and $baseDesc) { "[$storeTag] $baseDesc" } elseif ($storeTag) { "[$storeTag] Store game directory module" } else { $baseDesc }
             $item = [PSCustomObject]@{
                 Name        = $modName
                 Path        = $modPath
-                Description = (Get-LiveHookDllDescription -ModuleName $modName)
+                Description = $fullDesc
+                Store       = $storeTag
                 Key         = "$modName|$modPath"
             }
             [void]$allModules.Add($item)
@@ -985,6 +1960,9 @@ function Get-ProcessHookSnapshot {
         State = $state; Message = $message; Findings = $findings; TotalModuleCount = $allModules.Count; HistoricalCapture = $historicalCapture
     }
 }
+
+# Pre-populate store game paths at startup
+$null = Get-InstalledStoreGames -Refresh
 
 if ($AutoBlock) {
     Write-DiagnosticLog -Level "INFO" -Source "AUTOBLOCK" -Message "Starting scheduled AutoBlock run."
@@ -1077,7 +2055,7 @@ Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
 
-Write-DiagnosticLog -Level "INFO" -Source "APP" -Message "ZeroHook GUI started (Build: v.1.0.0)."
+Write-DiagnosticLog -Level "INFO" -Source "APP" -Message "ZeroHook GUI started (Build: v.1.0.1)."
 
 function Get-ZeroHookLogo {
     param([string]$ExplicitPath = "")
@@ -1221,7 +2199,7 @@ $ZeroHookLogo = Get-ZeroHookLogo
                 <Image x:Name="ImgHeaderLogo" Width="28" Height="28" Margin="0,0,10,0" VerticalAlignment="Center"
                        RenderOptions.BitmapScalingMode="HighQuality"/>
                 <TextBlock Text="ZeroHook" FontSize="18" FontWeight="Bold" Foreground="#FFFFFF" VerticalAlignment="Center"/>
-                <TextBlock Text="Made by: GS  |  Build: v.1.0.0"
+                <TextBlock Text="Made by: GS  |  Build: v.1.0.1"
                            FontSize="11" Foreground="#71717A" Margin="10,2,0,0" VerticalAlignment="Center"/>
                 <TextBlock Text="- Bloat &amp; Overlay Blocker + Real-Time Game DLL Hook Detector"
                            FontSize="11.5" Foreground="#A1A1AA" Margin="10,1,0,0" VerticalAlignment="Center"/>
@@ -1921,9 +2899,10 @@ function Get-SelectedHookTarget {
             $p = Get-Process -Id $sel.Id -ErrorAction Stop
             $startedUtc = try { $p.StartTime.ToUniversalTime() } catch { $null }
             $path = try { [string]$p.Path } catch { $sel.Path }
+            $pName = [string]$p.ProcessName
             $p.Dispose()
             return [PSCustomObject]@{
-                Id = [int]$sel.Id; Name = [string]$p.ProcessName; Path = [string]$path; StartedUtc = $startedUtc
+                Id = [int]$sel.Id; Name = $pName; Path = [string]$path; StartedUtc = $startedUtc
             }
         } catch { return $null }
     }
@@ -1951,11 +2930,7 @@ function Render-HookLogFromState {
                 if ($isCollapsible -and $isMin) {
                     Add-HookLog -Badge "  [$($f.Id)] $($f.Label) " -Message "($($f.Modules.Count) module(s) — minimized)" -BadgeColor "Yellow" -MsgColor "Muted" -ToggleCategoryId $f.Id -NoScroll
                 } else {
-                    if ($isCollapsible) {
-                        Add-HookLog -Badge "  [$($f.Id)] $($f.Label) " -Message "($($f.Scope))" -BadgeColor "Yellow" -MsgColor "Muted" -ToggleCategoryId $f.Id -NoScroll
-                    } else {
-                        Add-HookLog -Badge "  [$($f.Id)] $($f.Label) " -Message "($($f.Scope))" -BadgeColor "Yellow" -MsgColor "Muted" -ToggleCategoryId $f.Id -NoScroll
-                    }
+                    Add-HookLog -Badge "  [$($f.Id)] $($f.Label) " -Message "($($f.Scope))" -BadgeColor "Yellow" -MsgColor "Muted" -ToggleCategoryId $f.Id -NoScroll
                     foreach ($m in $f.Modules) {
                         $descSuffix = if (-not [string]::IsNullOrWhiteSpace($m.Description)) { " — $($m.Description)" } else { "" }
                         Add-HookLog -Message "     - $(Hide-Username $m.Path)$descSuffix" -MsgColor "Gray" -NoScroll
@@ -2871,14 +3846,21 @@ function Prompt-CloseLaunchers {
             foreach ($ProcName in $LauncherProcesses) {
                 Get-Process -Name $ProcName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             }
-            Start-Sleep -Seconds 2
+            [System.Windows.Forms.Application]::DoEvents()
         }
     }
 }
 
 function Invoke-BlockHooksGUI {
+    param(
+        $DllList = $null,
+        $VulkanList = $null
+    )
     $ExcludedIds = Get-SavedExclusions
-    foreach ($File in (Get-OverlayDLLs)) {
+    $targetDlls = if ($null -ne $DllList) { $DllList } else { Get-OverlayDLLs }
+    $targetVulkan = if ($null -ne $VulkanList) { $VulkanList } else { Get-VulkanLayersList }
+
+    foreach ($File in $targetDlls) {
         if ($ExcludedIds -contains "DLL|$($File.FullName)") { continue }
         $appTag = Get-AppGroupName "$($File.Name) $($File.FullName)"
         try {
@@ -2891,7 +3873,7 @@ function Invoke-BlockHooksGUI {
             Add-Log -Badge "[FAILED][$appTag] " -Message "$(Hide-Username $File.FullName) - $($_.Exception.Message)" -BadgeColor "Red" -MsgColor "Red" -NoScroll
         }
     }
-    foreach ($Layer in (Get-VulkanLayersList)) {
+    foreach ($Layer in $targetVulkan) {
         if ($ExcludedIds -contains "VULKAN|$($Layer.Key)|$($Layer.Name)") { continue }
         $appTag = Get-AppGroupName $Layer.Name
         try {
@@ -2915,7 +3897,14 @@ function Invoke-BlockHooksGUI {
 }
 
 function Invoke-RestoreHooksGUI {
-    foreach ($File in (Get-OverlayDLLs)) {
+    param(
+        $DllList = $null,
+        $VulkanList = $null
+    )
+    $targetDlls = if ($null -ne $DllList) { $DllList } else { Get-OverlayDLLs }
+    $targetVulkan = if ($null -ne $VulkanList) { $VulkanList } else { Get-VulkanLayersList }
+
+    foreach ($File in $targetDlls) {
         $appTag = Get-AppGroupName "$($File.Name) $($File.FullName)"
         try {
             $Acl = Get-Acl -Path $File.FullName
@@ -2931,7 +3920,7 @@ function Invoke-RestoreHooksGUI {
             Add-Log -Badge "[FAILED RESTORE][$appTag] " -Message "$(Hide-Username $File.FullName) - $($_.Exception.Message)" -BadgeColor "Red" -MsgColor "Red" -NoScroll
         }
     }
-    foreach ($Layer in (Get-VulkanLayersList)) {
+    foreach ($Layer in $targetVulkan) {
         try {
             Set-ItemProperty -Path $Layer.Key -Name $Layer.Name -Value 0 -Type DWord
         } catch {
@@ -2947,8 +3936,19 @@ function Invoke-RestoreHooksGUI {
 }
 
 function Invoke-BlockUtilitiesGUI {
+    param(
+        $ServiceList = $null,
+        $StartupList = $null,
+        $ShortcutList = $null,
+        $TaskList = $null
+    )
     $ExcludedIds = Get-SavedExclusions
-    foreach ($Svc in (Get-UtilityServices)) {
+    $targetServices = if ($null -ne $ServiceList) { $ServiceList } else { Get-UtilityServices }
+    $targetStartup = if ($null -ne $StartupList) { $StartupList } else { Get-UtilityStartupItems }
+    $targetShortcuts = if ($null -ne $ShortcutList) { $ShortcutList } else { Get-UtilityStartupShortcuts }
+    $targetTasks = if ($null -ne $TaskList) { $TaskList } else { Get-UtilityScheduledTasks }
+
+    foreach ($Svc in $targetServices) {
         if ($ExcludedIds -contains "SVC|$($Svc.Name)") { continue }
         $appTag = Get-AppGroupName "$($Svc.Name) $($Svc.DisplayName)"
         try {
@@ -2960,7 +3960,7 @@ function Invoke-BlockUtilitiesGUI {
         }
     }
     $DisabledBytes = [byte[]](0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
-    foreach ($Item in (Get-UtilityStartupItems)) {
+    foreach ($Item in $targetStartup) {
         if ($ExcludedIds -contains "RUN|$($Item.RunPath)|$($Item.Name)") { continue }
         $appTag = Get-AppGroupName "$($Item.Name) $($Item.Command)"
         try {
@@ -2971,7 +3971,7 @@ function Invoke-BlockUtilitiesGUI {
             Add-Log -Badge "[FAILED STARTUP][$appTag] " -Message "$($Item.Name) - $($_.Exception.Message)" -BadgeColor "Red" -MsgColor "Red" -NoScroll
         }
     }
-    foreach ($Sc in (Get-UtilityStartupShortcuts | Where-Object { -not $_.IsDisabled })) {
+    foreach ($Sc in ($targetShortcuts | Where-Object { -not $_.IsDisabled })) {
         if ($ExcludedIds -contains "SHORTCUT|$($Sc.OrigFolder)|$($Sc.Name)") { continue }
         $appTag = Get-AppGroupName "$($Sc.Name) $($Sc.FullPath)"
         try {
@@ -2984,7 +3984,7 @@ function Invoke-BlockUtilitiesGUI {
             Add-Log -Badge "[FAILED SHORTCUT][$appTag] " -Message "$($Sc.Name) - $($_.Exception.Message)" -BadgeColor "Red" -MsgColor "Red" -NoScroll
         }
     }
-    foreach ($Task in (Get-UtilityScheduledTasks)) {
+    foreach ($Task in $targetTasks) {
         if ($ExcludedIds -contains "TASK|$($Task.TaskPath)$($Task.TaskName)") { continue }
         $appTag = Get-AppGroupName "$($Task.TaskPath)$($Task.TaskName)"
         try {
@@ -2997,7 +3997,18 @@ function Invoke-BlockUtilitiesGUI {
 }
 
 function Invoke-RestoreUtilitiesGUI {
-    foreach ($Svc in (Get-UtilityServices)) {
+    param(
+        $ServiceList = $null,
+        $StartupList = $null,
+        $ShortcutList = $null,
+        $TaskList = $null
+    )
+    $targetServices = if ($null -ne $ServiceList) { $ServiceList } else { Get-UtilityServices }
+    $targetStartup = if ($null -ne $StartupList) { $StartupList } else { Get-UtilityStartupItems }
+    $targetShortcuts = if ($null -ne $ShortcutList) { $ShortcutList } else { Get-UtilityStartupShortcuts }
+    $targetTasks = if ($null -ne $TaskList) { $TaskList } else { Get-UtilityScheduledTasks }
+
+    foreach ($Svc in $targetServices) {
         try {
             Set-Service -Name $Svc.Name -StartupType Automatic -ErrorAction Stop
             Start-Service -Name $Svc.Name -ErrorAction SilentlyContinue
@@ -3006,14 +4017,14 @@ function Invoke-RestoreUtilitiesGUI {
         }
     }
     $EnabledBytes = [byte[]](0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
-    foreach ($Item in (Get-UtilityStartupItems)) {
+    foreach ($Item in $targetStartup) {
         try {
             if (Test-Path $Item.ApprovedPath) { Set-ItemProperty -Path $Item.ApprovedPath -Name $Item.Name -Value $EnabledBytes -Type Binary -ErrorAction Stop }
         } catch {
             Add-Log -Badge "[FAILED RESTORE STARTUP] " -Message "$($Item.Name) - $($_.Exception.Message)" -BadgeColor "Red" -MsgColor "Red" -NoScroll
         }
     }
-    foreach ($Sc in (Get-UtilityStartupShortcuts | Where-Object { $_.IsDisabled })) {
+    foreach ($Sc in ($targetShortcuts | Where-Object { $_.IsDisabled })) {
         try {
             if (-not (Test-Path $Sc.OrigFolder)) { New-Item -Path $Sc.OrigFolder -ItemType Directory -Force | Out-Null }
             Move-Item -Path $Sc.FullPath -Destination (Join-Path $Sc.OrigFolder $Sc.Name) -Force -ErrorAction Stop
@@ -3021,7 +4032,7 @@ function Invoke-RestoreUtilitiesGUI {
             Add-Log -Badge "[FAILED RESTORE SHORTCUT] " -Message "$($Sc.Name) - $($_.Exception.Message)" -BadgeColor "Red" -MsgColor "Red" -NoScroll
         }
     }
-    foreach ($Task in (Get-UtilityScheduledTasks)) {
+    foreach ($Task in $targetTasks) {
         try {
             Enable-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -ErrorAction Stop | Out-Null
         } catch {
@@ -3042,7 +4053,7 @@ $BtnCopyBugReport.Add_Click({
         $BtnCopyBugReport.Content = "Copied!"
         Add-Log -Badge "[$(Get-Date -Format 'HH:mm:ss')] [BUG REPORT COPIED] " -Message "Diagnostic info and recent logs copied to clipboard. Paste it in your message/issue to GS." -BadgeColor "Green" -MsgColor "Gray"
         [System.Windows.Forms.Application]::DoEvents()
-        Start-Sleep -Milliseconds 350
+        Start-Sleep -Milliseconds 150
         $BtnCopyBugReport.Content = "Copy Log for Dev"
     } catch {
         Write-DiagnosticLog -Level "ERROR" -Source "CLIPBOARD" -Message "Failed to copy bug report: $($_.Exception.Message)" -ForceTrim
@@ -3051,7 +4062,10 @@ $BtnCopyBugReport.Add_Click({
 })
 
 $BtnAboutInfo.Add_Click({ Show-AboutInfoWindow })
-$BtnRefresh.Add_Click({ Update-Dashboard -Filter "ALL" })
+$BtnRefresh.Add_Click({
+    $null = Get-InstalledStoreGames -Refresh
+    Update-Dashboard -Filter "ALL"
+})
 $BtnQuickFilter.Add_Click({
     $Script:SuppressFilterEvent = $true
     $CmbAppFilter.SelectedIndex = 0
@@ -3069,8 +4083,9 @@ $CardLaunchers.Add_Click({ Render-FilteredLog -Filter "LAUNCHERS" })
 $BtnBlockAll.Add_Click({
     Clear-Log "ACTIVITY LOG - BLOCKING EVERYTHING (HOOKS + RGB/BLOAT)"
     Prompt-CloseLaunchers
-    Invoke-BlockHooksGUI
-    Invoke-BlockUtilitiesGUI
+    $D = $Script:ScanData
+    Invoke-BlockHooksGUI -DllList $D.Dlls -VulkanList $D.VulkanLayers
+    Invoke-BlockUtilitiesGUI -ServiceList $D.Services -StartupList $D.StartupItems -ShortcutList $D.Shortcuts -TaskList $D.VendorTasks
     Add-Log -Badge "`n=== BLOCK COMPLETE ===" -BadgeColor "Cyan"
     Update-Dashboard -Filter "NONE"
 })
@@ -3080,8 +4095,9 @@ $BtnCustomBlock.Add_Click({ Show-CustomBlockDialog })
 $BtnRestoreAll.Add_Click({
     Clear-Log "ACTIVITY LOG - RESTORING EVERYTHING"
     Prompt-CloseLaunchers
-    Invoke-RestoreHooksGUI
-    Invoke-RestoreUtilitiesGUI
+    $D = $Script:ScanData
+    Invoke-RestoreHooksGUI -DllList $D.Dlls -VulkanList $D.VulkanLayers
+    Invoke-RestoreUtilitiesGUI -ServiceList $D.Services -StartupList $D.StartupItems -ShortcutList $D.Shortcuts -TaskList $D.VendorTasks
     Add-Log -Badge "`n=== RESTORE COMPLETE ===" -BadgeColor "Cyan"
     Update-Dashboard -Filter "NONE"
 })
@@ -3089,7 +4105,8 @@ $BtnRestoreAll.Add_Click({
 $BtnBlockOverlaysOnly.Add_Click({
     Clear-Log "ACTIVITY LOG - BLOCKING OVERLAY HOOKS ONLY"
     Prompt-CloseLaunchers
-    Invoke-BlockHooksGUI
+    $D = $Script:ScanData
+    Invoke-BlockHooksGUI -DllList $D.Dlls -VulkanList $D.VulkanLayers
     Add-Log -Badge "`n=== OVERLAY HOOK BLOCK COMPLETE ===" -BadgeColor "Cyan"
     Update-Dashboard -Filter "NONE"
 })
