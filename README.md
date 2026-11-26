@@ -47,9 +47,6 @@ ZeroHook blocks those hook libraries at the OS/permission level so they cannot l
 * **On-Demand Scanning:** Runs only when you trigger a scan—no background polling.
 * **Exclusions Support (`exclusions.json`):** Whitelist trusted DLLs or processes you intentionally run.
 
-### 4. Foreground Window Locker
-* **Focus Protection:** Prevents background popups, updaters, or notifications from stealing focus or minimizing full-screen/borderless games.
-
 ---
 
 ## Requirements & Permissions
