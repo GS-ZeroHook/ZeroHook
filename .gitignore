@@ -1,0 +1,10 @@
+﻿*.log
+*.tmp
+*.zip
+bin/
+obj/
+out/
+publish/
+_build/
+zerohook-current.log
+exclusions.json
