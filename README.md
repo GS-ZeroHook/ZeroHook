@@ -34,7 +34,7 @@ ZeroHook blocks those hook libraries at the OS/permission level so they cannot l
 ### 1. Overlay & Hook Blocker
 * **DLL & Overlay Blocking:** Blocks overlay and hook DLLs (Steam, Discord, GeForce Experience/NVIDIA App, AMD Radeon, RTSS/MSI Afterburner, Overwolf, and vendor utilities) using reversible file/ACL permissions so they cannot inject into games—even when disabled in client settings.
 * **Vulkan Implicit Layers:** Detects and disables intrusive Vulkan implicit layers in the Windows Registry while preserving clean restoration paths.
-* **Xbox Game Bar & Game DVR:** Disables Windows Game Bar and background capture/DVR hooks that can cause stuttering or input lag.
+* **Xbox Game Bar & Game DVR:** Disables Windows Game Bar and background capture/DVR hooks that can cause stuttering or input lag (Windows Game Mode is never modified).
 * **One-Click Restore:** Every change is non-destructive and can be reverted individually or all at once.
 
 ### 2. Vendor Bloat & Background Process Control
