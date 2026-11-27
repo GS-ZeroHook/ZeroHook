@@ -187,8 +187,8 @@ $LiveHookMap = @{
     "wininet.dll"                              = "ProxyHook"
     "winhttp.dll"                              = "ProxyHook"
     "xlive.dll"                                = "ProxyHook"
-    "binkw32.dll"                              = "ProxyHook"
-    "binkw64.dll"                              = "ProxyHook"
+    "binkw32.dll"                               = "ProxyHook"
+    "binkw64.dll"                               = "ProxyHook"
     "bink2w32.dll"                             = "ProxyHook"
     "bink2w64.dll"                             = "ProxyHook"
     "vorbisfile.dll"                           = "ProxyHook"
@@ -255,8 +255,8 @@ $CollapsibleHookCategories = @(
 )
 
 $LiveHookDllDescriptions = @{
-    "reshade64.dll"                            = "ReShade (64-bit) — installed under a proxy/custom name or loaded by another component"
-    "reshade32.dll"                            = "ReShade (32-bit) — installed under a proxy/custom name or loaded by another component"
+    "reshade64.dll"                            = "ReShade (64-bit) - installed under a proxy/custom name or loaded by another component"
+    "reshade32.dll"                            = "ReShade (32-bit) - installed under a proxy/custom name or loaded by another component"
     "dxgi.dll"                                 = "Shared proxy name (ReShade, OptiScaler, DXVK, ASI Loader, MFG Unlocker, DLSSG 2.0-3.0, or native/local library)"
     "d3d9.dll"                                 = "Shared proxy / Direct3D 9 name (ReShade, DXVK, ASI Loader, MFG Unlocker, or native/local library)"
     "d3d10.dll"                                = "Shared proxy / Direct3D 10 name (ReShade, ASI Loader, MFG Unlocker, or native/local library)"
@@ -270,8 +270,8 @@ $LiveHookDllDescriptions = @{
     "ddraw.dll"                                = "Shared proxy / DirectDraw name (ReShade, ASI Loader, or native/local library)"
     "xinput1_3.dll"                            = "Shared proxy / XInput 1.3 name (ReShade, ASI Loader, MFG Unlocker, or system/local library)"
     "msvcp140.dll"                             = "ReShade proxy target name or Visual C++ runtime library"
-    "bink2w64.dll"                              = "Shared proxy name (ReShade, ASI Loader, MFG Unlocker, or game Bink video library)"
-    "bink2w32.dll"                              = "Shared proxy name (32-bit ASI Loader or game Bink video library)"
+    "bink2w64.dll"                             = "Shared proxy name (ReShade, ASI Loader, MFG Unlocker, or game Bink video library)"
+    "bink2w32.dll"                             = "Shared proxy name (32-bit ASI Loader or game Bink video library)"
     "binkw64.dll"                              = "Shared proxy name (64-bit ASI Loader or MFG Unlocker)"
     "binkw32.dll"                              = "Shared proxy name (32-bit ASI Loader)"
     "d3d8.dll"                                 = "DXVK (32/64-bit by game) or ASI Loader proxy name"
@@ -575,6 +575,27 @@ $StartupLocations = @(
     @{ Run = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run"; Approved = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32" }
 )
 
+function Get-EffectiveStartupLocations {
+    $locs = [System.Collections.Generic.List[object]]::new()
+    foreach ($l in $StartupLocations) { [void]$locs.Add($l) }
+    $isSys = ($env:USERNAME -eq "SYSTEM") -or ([System.Security.Principal.WindowsIdentity]::GetCurrent().IsSystem)
+    if ($isSys) {
+        if (-not (Get-PSDrive -Name "HKU" -ErrorAction SilentlyContinue)) {
+            try { New-PSDrive -Name "HKU" -PSProvider Registry -Root "HKEY_USERS" -ErrorAction SilentlyContinue | Out-Null } catch {}
+        }
+        if (Get-PSDrive -Name "HKU" -ErrorAction SilentlyContinue) {
+            foreach ($sidKey in (Get-ChildItem -Path "HKU:\" -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^S-1-5-21-[\d-]+$' })) {
+                $hive = "HKU:\$($sidKey.PSChildName)"
+                [void]$locs.Add(@{
+                    Run      = "$hive\Software\Microsoft\Windows\CurrentVersion\Run"
+                    Approved = "$hive\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+                })
+            }
+        }
+    }
+    return $locs.ToArray()
+}
+
 $StartupFolderPaths = @(
     "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup",
     "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
@@ -584,6 +605,7 @@ $LocalInstallDir        = "$env:ProgramData\ZeroHook"
 $LocalScriptPath        = Join-Path $LocalInstallDir "ZeroHook.ps1"
 $UserConfigDir          = Join-Path $env:LOCALAPPDATA "ZeroHook"
 $ExclusionsFile         = Join-Path $UserConfigDir "exclusions.json"
+$SharedExclusionsFile   = Join-Path $LocalInstallDir "exclusions.json"
 $RoamingExclusionsFile  = Join-Path $env:APPDATA "ZeroHook\exclusions.json"
 $LegacyExclusionsFile   = Join-Path $StartupBackupDir "exclusions.json"
 $LogDir                 = Join-Path $env:LOCALAPPDATA "ZeroHook\Logs"
@@ -1830,7 +1852,7 @@ function Copy-BugReportToClipboard {
 
     $report = @(
         "=== ZeroHook Bug Report ==="
-        "App: ZeroHook (Made by: GS | Build: v.1.0.4)"
+        "App: ZeroHook (Made by: GS | Build: v.1.0.6)"
         "SessionId: $Script:SessionId | RunMode: $($envInfo.Mode)"
         "Section: $FallbackTitle"
         "Timestamp (UTC): $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'))Z"
@@ -1908,38 +1930,55 @@ function Invoke-RelaunchDebugMode {
 function Get-SavedExclusions {
     $targetDir = if ($UserConfigDir) { $UserConfigDir } else { Join-Path $env:LOCALAPPDATA "ZeroHook" }
     $targetPath = if ($ExclusionsFile) { $ExclusionsFile } else { Join-Path $targetDir "exclusions.json" }
+    $sharedPath = if ($SharedExclusionsFile) { $SharedExclusionsFile } else { Join-Path "$env:ProgramData\ZeroHook" "exclusions.json" }
+    $isSystemContext = ($env:USERNAME -eq "SYSTEM") -or ([System.Security.Principal.WindowsIdentity]::GetCurrent().IsSystem)
 
-    if (-not (Test-Path -LiteralPath $targetPath)) {
-        foreach ($srcPath in @($RoamingExclusionsFile, $LegacyExclusionsFile)) {
-            if ($srcPath -and ($srcPath -ne $targetPath) -and (Test-Path -LiteralPath $srcPath)) {
-                try {
-                    if (-not (Test-Path -LiteralPath $targetDir)) {
-                        [System.IO.Directory]::CreateDirectory($targetDir) | Out-Null
-                    }
-                    Copy-Item -LiteralPath $srcPath -Destination $targetPath -Force -ErrorAction Stop
-                    Write-DiagnosticLog -Level "INFO" -Source "EXCLUSIONS" -Message "Migrated legacy exclusions from $(Hide-Username $srcPath) to $(Hide-Username $targetPath)." -ForceTrim
-                    break
-                } catch {
-                    [void](Write-DiagnosticError -Source "EXCLUSIONS" -Context "Migrate legacy exclusions" -Target $srcPath -ErrorRecord $_)
-                }
-            }
+    $candidatePaths = [System.Collections.Generic.List[string]]::new()
+    if ($AutoBlock -or $isSystemContext) {
+        if ($sharedPath) { [void]$candidatePaths.Add($sharedPath) }
+        if ($targetPath -and ($targetPath -ne $sharedPath)) { [void]$candidatePaths.Add($targetPath) }
+    } else {
+        if ($targetPath) { [void]$candidatePaths.Add($targetPath) }
+        if ($sharedPath -and ($sharedPath -ne $targetPath)) { [void]$candidatePaths.Add($sharedPath) }
+    }
+    foreach ($legacyPath in @($RoamingExclusionsFile, $LegacyExclusionsFile)) {
+        if ($legacyPath -and -not $candidatePaths.Contains($legacyPath)) {
+            [void]$candidatePaths.Add($legacyPath)
         }
     }
 
-    if (Test-Path -LiteralPath $targetPath) {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    foreach ($candPath in $candidatePaths) {
+        if (-not (Test-Path -LiteralPath $candPath)) { continue }
         try {
-            $rawText = [System.IO.File]::ReadAllText($targetPath, (New-Object System.Text.UTF8Encoding($false)))
+            $rawText = [System.IO.File]::ReadAllText($candPath, $utf8NoBom)
             if (-not [string]::IsNullOrWhiteSpace($rawText)) {
                 $parsed = ConvertFrom-Json -InputObject $rawText
                 if ($null -ne $parsed) {
                     $ids = @($parsed | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-                    Write-DiagnosticLog -Level "DEBUG" -Source "EXCLUSIONS" -Message "Loaded $($ids.Count) exclusion(s) from $(Hide-Username $targetPath)."
+                    # Keep user and shared copies synchronized when running interactively
+                    if (-not $isSystemContext) {
+                        if ($candPath -ne $targetPath -and -not (Test-Path -LiteralPath $targetPath)) {
+                            try {
+                                if (-not (Test-Path -LiteralPath $targetDir)) { [System.IO.Directory]::CreateDirectory($targetDir) | Out-Null }
+                                [System.IO.File]::WriteAllText($targetPath, $rawText, $utf8NoBom)
+                            } catch {}
+                        }
+                        if ($sharedPath -and -not (Test-Path -LiteralPath $sharedPath)) {
+                            try {
+                                $sharedDir = Split-Path -Parent $sharedPath
+                                if (-not (Test-Path -LiteralPath $sharedDir)) { [System.IO.Directory]::CreateDirectory($sharedDir) | Out-Null }
+                                [System.IO.File]::WriteAllText($sharedPath, $rawText, $utf8NoBom)
+                            } catch {}
+                        }
+                    }
+                    Write-DiagnosticLog -Level "DEBUG" -Source "EXCLUSIONS" -Message "Loaded $($ids.Count) exclusion(s) from $(Hide-Username $candPath)."
                     Log-ExclusionsOnce -ExcludedIds $ids
                     return $ids
                 }
             }
         } catch {
-            [void](Write-DiagnosticError -Source "EXCLUSIONS" -Context "Read exclusions.json" -Target $targetPath -ErrorRecord $_ -ForceTrim)
+            [void](Write-DiagnosticError -Source "EXCLUSIONS" -Context "Read exclusions.json" -Target $candPath -ErrorRecord $_ -ForceTrim)
         }
     }
     Log-ExclusionsOnce -ExcludedIds @()
@@ -1950,6 +1989,7 @@ function Save-Exclusions {
     param([string[]]$Ids)
     $targetDir = if ($UserConfigDir) { $UserConfigDir } else { Join-Path $env:LOCALAPPDATA "ZeroHook" }
     $targetFile = if ($ExclusionsFile) { $ExclusionsFile } else { Join-Path $targetDir "exclusions.json" }
+    $sharedFile = if ($SharedExclusionsFile) { $SharedExclusionsFile } else { Join-Path "$env:ProgramData\ZeroHook" "exclusions.json" }
 
     try {
         if (-not (Test-Path -LiteralPath $targetDir)) {
@@ -1974,8 +2014,21 @@ function Save-Exclusions {
 
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllText($targetFile, $json, $utf8NoBom)
+
+        $sharedSynced = $false
+        try {
+            $sharedDir = Split-Path -Parent $sharedFile
+            if (-not (Test-Path -LiteralPath $sharedDir)) {
+                [System.IO.Directory]::CreateDirectory($sharedDir) | Out-Null
+            }
+            [System.IO.File]::WriteAllText($sharedFile, $json, $utf8NoBom)
+            $sharedSynced = $true
+        } catch {
+            [void](Write-DiagnosticError -Source "EXCLUSIONS" -Context "Mirror exclusions.json to ProgramData" -Target $sharedFile -ErrorRecord $_ -ForceTrim)
+        }
+
         $exSummary = Get-ExclusionsDiagnosticSummary -ExcludedIds $cleanIds
-        Write-DiagnosticLog -Level "INFO" -Source "EXCLUSIONS" -Message "Saved $($cleanIds.Count) exclusion(s) to $(Hide-Username $targetFile) | $($exSummary.Summary)." -ForceTrim
+        Write-DiagnosticLog -Level "INFO" -Source "EXCLUSIONS" -Message "Saved $($cleanIds.Count) exclusion(s) to $(Hide-Username $targetFile) (SharedSynced=$sharedSynced) | $($exSummary.Summary)." -ForceTrim
     } catch {
         [void](Write-DiagnosticError -Source "EXCLUSIONS" -Context "Save exclusions.json" -Target $targetFile -ErrorRecord $_ -ForceTrim)
         try {
@@ -1995,7 +2048,15 @@ function Test-ItemExcluded {
         [string[]]$ExcludedIds
     )
     if ([string]::IsNullOrWhiteSpace($Id) -or -not $ExcludedIds) { return $false }
-    return ($ExcludedIds -contains $Id)
+    $normId = ($Id.Trim() -replace '/', '\')
+    foreach ($ex in $ExcludedIds) {
+        if ([string]::IsNullOrWhiteSpace($ex)) { continue }
+        $normEx = ($ex.Trim() -replace '/', '\')
+        if ($normId.Equals($normEx, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Test-IsEveryoneDenyRule {
@@ -2144,7 +2205,7 @@ function Get-UtilityServices {
 
 function Get-UtilityStartupItems {
     $Items = @()
-    foreach ($Loc in $StartupLocations) {
+    foreach ($Loc in (Get-EffectiveStartupLocations)) {
         if (Test-Path $Loc.Run) {
             $Props = Get-ItemProperty -Path $Loc.Run
             foreach ($Prop in $Props.PSObject.Properties) {
@@ -2375,17 +2436,37 @@ if ($AutoBlock) {
             [void](Write-DiagnosticError -Source "AUTOBLOCK" -Context "Disable Vulkan layer" -Target "$($Layer.Key)\$($Layer.Name)" -ErrorRecord $_ -ForceTrim)
         }
     }
+    $isSystemAutoBlock = ($env:USERNAME -eq "SYSTEM") -or ([System.Security.Principal.WindowsIdentity]::GetCurrent().IsSystem)
+    $userHiveRoots = @("HKCU:")
+    if ($isSystemAutoBlock) {
+        if (-not (Get-PSDrive -Name "HKU" -ErrorAction SilentlyContinue)) {
+            try { New-PSDrive -Name "HKU" -PSProvider Registry -Root "HKEY_USERS" -ErrorAction SilentlyContinue | Out-Null } catch {}
+        }
+        if (Get-PSDrive -Name "HKU" -ErrorAction SilentlyContinue) {
+            $loadedSids = @(Get-ChildItem -Path "HKU:\" -ErrorAction SilentlyContinue |
+                Where-Object { $_.PSChildName -match '^S-1-5-21-[\d-]+$' } |
+                ForEach-Object { "HKU:\$($_.PSChildName)" })
+            if ($loadedSids.Count -gt 0) {
+                $userHiveRoots = $loadedSids
+            }
+        }
+    }
+
     if (-not (Test-ItemExcluded -Id "GAMEBAR|XBOX" -ExcludedIds $ExcludedIds)) {
-        try {
-            New-Item -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" -Force -ErrorAction Stop | Out-Null
-            Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" -Name "AppCaptureEnabled" -Value 0 -Type DWord -ErrorAction Stop
-            New-Item -Path "HKCU:\System\GameConfigStore" -Force -ErrorAction Stop | Out-Null
-            Set-ItemProperty -Path "HKCU:\System\GameConfigStore" -Name "GameDVR_Enabled" -Value 0 -Type DWord -ErrorAction Stop
-            Remove-ItemProperty -Path "HKCU:\System\GameConfigStore" -Name "GameDVR_FSEBehaviorMode" -ErrorAction SilentlyContinue
-            $blockedCount++
-        } catch {
-            $errCount++
-            [void](Write-DiagnosticError -Source "AUTOBLOCK" -Context "Disable Xbox Game Bar/DVR" -Target "HKCU GameDVR/GameConfigStore" -ErrorRecord $_ -ForceTrim)
+        foreach ($hiveRoot in $userHiveRoots) {
+            try {
+                $gameDvrPath = "$hiveRoot\Software\Microsoft\Windows\CurrentVersion\GameDVR"
+                $gameCfgPath = "$hiveRoot\System\GameConfigStore"
+                New-Item -Path $gameDvrPath -Force -ErrorAction Stop | Out-Null
+                Set-ItemProperty -Path $gameDvrPath -Name "AppCaptureEnabled" -Value 0 -Type DWord -ErrorAction Stop
+                New-Item -Path $gameCfgPath -Force -ErrorAction Stop | Out-Null
+                Set-ItemProperty -Path $gameCfgPath -Name "GameDVR_Enabled" -Value 0 -Type DWord -ErrorAction Stop
+                Remove-ItemProperty -Path $gameCfgPath -Name "GameDVR_FSEBehaviorMode" -ErrorAction SilentlyContinue
+                $blockedCount++
+            } catch {
+                $errCount++
+                [void](Write-DiagnosticError -Source "AUTOBLOCK" -Context "Disable Xbox Game Bar/DVR" -Target "$hiveRoot GameDVR/GameConfigStore" -ErrorRecord $_ -ForceTrim)
+            }
         }
     } else {
         $skippedCount++
@@ -2403,7 +2484,9 @@ if ($AutoBlock) {
     }
     $DisabledBytes = [byte[]](0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
     foreach ($Item in (Get-UtilityStartupItems)) {
-        if (Test-ItemExcluded -Id "RUN|$($Item.RunPath)|$($Item.Name)" -ExcludedIds $ExcludedIds) { $skippedCount++; continue }
+        $hkcuNormalizedRun = $Item.RunPath -replace '^HKU:\\S-1-5-21-[\d-]+\\', 'HKCU:\'
+        if ((Test-ItemExcluded -Id "RUN|$($Item.RunPath)|$($Item.Name)" -ExcludedIds $ExcludedIds) -or
+            (Test-ItemExcluded -Id "RUN|$hkcuNormalizedRun|$($Item.Name)" -ExcludedIds $ExcludedIds)) { $skippedCount++; continue }
         try {
             if (-not (Test-Path $Item.ApprovedPath)) { New-Item -Path $Item.ApprovedPath -Force -ErrorAction Stop | Out-Null }
             Set-ItemProperty -Path $Item.ApprovedPath -Name $Item.Name -Value $DisabledBytes -Type Binary -ErrorAction Stop
@@ -2449,7 +2532,7 @@ Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
 
-Write-DiagnosticLog -Level "INFO" -Source "APP" -Message "ZeroHook GUI started (Build: v.1.0.4)."
+Write-DiagnosticLog -Level "INFO" -Source "APP" -Message "ZeroHook GUI started (Build: v.1.0.6)."
 
 function Get-ZeroHookLogo {
     param([string]$ExplicitPath = "")
@@ -2594,7 +2677,7 @@ $ZeroHookLogo = Get-ZeroHookLogo
                 <Image x:Name="ImgHeaderLogo" Width="28" Height="28" Margin="0,0,10,0" VerticalAlignment="Center"
                        RenderOptions.BitmapScalingMode="HighQuality"/>
                 <TextBlock Text="ZeroHook" FontSize="18" FontWeight="Bold" Foreground="#FFFFFF" VerticalAlignment="Center"/>
-                <TextBlock Text="Made by: GS  |  Build: v.1.0.4"
+                <TextBlock Text="Made by: GS  |  Build: v.1.0.6"
                            FontSize="11" Foreground="#71717A" Margin="10,2,0,0" VerticalAlignment="Center"/>
                 <TextBlock Text="- Bloat &amp; Overlay Blocker + Real-Time Game DLL Hook Detector"
                            FontSize="11.5" Foreground="#A1A1AA" Margin="10,1,0,0" VerticalAlignment="Center"/>
@@ -3149,19 +3232,24 @@ function New-CategoryToggleLink {
 function Save-LocalScriptCopy {
     $hostInfo = Get-HostRuntimeInfo
     if ($hostInfo.IsPortableExe) {
-        throw "Portable executable detected; no script copy is saved to ProgramData."
+        if ([string]::IsNullOrWhiteSpace($hostInfo.ExePath) -or -not (Test-Path -LiteralPath $hostInfo.ExePath)) {
+            throw "Portable executable path could not be resolved."
+        }
+        Write-DiagnosticLog -Level "INFO" -Source "TASK" -Message "Portable EXE detected ($(Hide-Username $hostInfo.ExePath)); using executable directly for scheduled task."
+        return $hostInfo.ExePath
     }
 
     if (-not (Test-Path -LiteralPath $LocalInstallDir)) {
         New-Item -Path $LocalInstallDir -ItemType Directory -Force | Out-Null
     }
 
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $utf8Reader = New-Object System.Text.UTF8Encoding($false)
+    $utf8BomWriter = New-Object System.Text.UTF8Encoding($true)
     $scriptText = $null
     $sourceUsed = "none"
 
     if ($hostInfo.SourceScriptPath) {
-        $scriptText = [System.IO.File]::ReadAllText($hostInfo.SourceScriptPath, $utf8NoBom)
+        $scriptText = [System.IO.File]::ReadAllText($hostInfo.SourceScriptPath, $utf8Reader)
         $sourceUsed = "ScriptFile"
     } elseif ($MyInvocation.MyCommand -and $MyInvocation.MyCommand.ScriptBlock) {
         $scriptText = $MyInvocation.MyCommand.ScriptBlock.ToString()
@@ -3172,7 +3260,7 @@ function Save-LocalScriptCopy {
         throw "Captured script source looks incomplete/empty (source=$sourceUsed, len=$(if ($scriptText) { $scriptText.Length } else { 0 })). Run ZeroHook from a .ps1 file to create the scheduled task."
     }
 
-    [System.IO.File]::WriteAllText($LocalScriptPath, $scriptText, $utf8NoBom)
+    [System.IO.File]::WriteAllText($LocalScriptPath, $scriptText, $utf8BomWriter)
     Write-DiagnosticLog -Level "INFO" -Source "TASK" -Message "Saved local script copy to $(Hide-Username $LocalScriptPath) via $sourceUsed (chars=$($scriptText.Length))."
     return $LocalScriptPath
 }
@@ -3418,13 +3506,13 @@ function Render-HookLogFromState {
                         $d = if (-not [string]::IsNullOrWhiteSpace($_.Description)) { " ($($_.Description))" } else { "" }
                         "$($_.Name) -> $(Hide-Username $_.Path)$d"
                     }) -join " | "
-                    Add-HookLog -Badge "  [$($f.Id)] $($f.Label) " -Message "($($f.Modules.Count) module(s) — minimized)" `
+                    Add-HookLog -Badge "  [$($f.Id)] $($f.Label) " -Message "($($f.Modules.Count) module(s) - minimized)" `
                         -BadgeColor $findingColor -MsgColor "Muted" -ToggleCategoryId $f.Id `
-                        -DiagMessage "[$($f.Id)] $($f.Label) ($($f.Modules.Count) module(s) — minimized in UI): $modDetails" -NoScroll
+                        -DiagMessage "[$($f.Id)] $($f.Label) ($($f.Modules.Count) module(s) - minimized in UI): $modDetails" -NoScroll
                 } else {
                     Add-HookLog -Badge "  [$($f.Id)] $($f.Label) " -Message "($($f.Scope))" -BadgeColor $findingColor -MsgColor "Muted" -ToggleCategoryId $f.Id -SkipDiagLog -NoScroll
                     foreach ($m in $f.Modules) {
-                        $descSuffix = if (-not [string]::IsNullOrWhiteSpace($m.Description)) { " — $($m.Description)" } else { "" }
+                        $descSuffix = if (-not [string]::IsNullOrWhiteSpace($m.Description)) { " - $($m.Description)" } else { "" }
                         Add-HookLog -Message "     - $(Hide-Username $m.Path)$descSuffix" -MsgColor "Gray" -SkipDiagLog -NoScroll
                     }
                     if ($LiveHookFeatures.Contains($f.Id)) {
@@ -3534,7 +3622,7 @@ function Invoke-HookMonitorStep {
                 }
                 foreach ($nm in $newModsInGroup) { [void]$Script:PendingHookDetections[$f.Id].Add($nm) }
                 $totalQueued = $Script:PendingHookDetections[$f.Id].Count
-                Add-HookLog -Badge "[$(Get-Date -Format 'HH:mm:ss')] [HOOK DETECTED][$($f.Id)] " -Message "$totalQueued module(s) detected (minimized — click [+] to expand)" -BadgeColor $findingColor -MsgColor "Muted" -ToggleCategoryId $f.Id -SkipDiagLog -NoScroll
+                Add-HookLog -Badge "[$(Get-Date -Format 'HH:mm:ss')] [HOOK DETECTED][$($f.Id)] " -Message "$totalQueued module(s) detected (minimized - click [+] to expand)" -BadgeColor $findingColor -MsgColor "Muted" -ToggleCategoryId $f.Id -SkipDiagLog -NoScroll
             } else {
                 foreach ($nm in $newModsInGroup) {
                     Add-HookLog -Badge "[$(Get-Date -Format 'HH:mm:ss')] [HOOK DETECTED][$($f.Id)] " -Message "$($nm.Name) -> $(Hide-Username $nm.Path)" -BadgeColor $findingColor -MsgColor "Gray" -ToggleCategoryId $f.Id -SkipDiagLog -NoScroll
@@ -3864,7 +3952,7 @@ function Show-ExclusionsDialog {
         </Grid.RowDefinitions>
 
         <StackPanel Grid.Row="0" Margin="0,0,0,8">
-            <TextBlock Text="EXCLUSIONS LIST — ITEMS YOU DO NOT WANT TO BLOCK" FontSize="15" FontWeight="Bold" Foreground="#FFFFFF"/>
+            <TextBlock Text="EXCLUSIONS LIST - ITEMS YOU DO NOT WANT TO BLOCK" FontSize="15" FontWeight="Bold" Foreground="#FFFFFF"/>
             <TextBlock Text="CHECKED items are EXCLUDED (kept active/allowed and skipped by Block Everything, Block Overlay Hooks Only, and Auto-Block). Unchecked items remain eligible to block."
                        FontSize="11.5" Foreground="#A1A1AA" Margin="0,2,0,0" TextWrapping="Wrap"/>
         </StackPanel>
@@ -4612,10 +4700,9 @@ function Invoke-RestoreUtilitiesGUI {
     foreach ($Svc in $targetServices) {
         $appTag = Get-AppGroupName "$($Svc.Name) $($Svc.DisplayName)"
         try {
-            if ($Svc.StartType -eq "Manual" -or $Svc.StartType -eq "Disabled") {
-                Set-Service -Name $Svc.Name -StartupType Automatic -ErrorAction Stop
-                Add-Log -Badge "[AUTO STARTUP][$appTag] " -Message "$($Svc.DisplayName) ($($Svc.Name))" -BadgeColor "Green" -NoScroll
-            }
+            Set-Service -Name $Svc.Name -StartupType Automatic -ErrorAction Stop
+            Start-Service -Name $Svc.Name -ErrorAction SilentlyContinue
+            Add-Log -Badge "[RESTORED AUTO][$appTag] " -Message "$($Svc.DisplayName) ($($Svc.Name))" -BadgeColor "Green" -NoScroll
         } catch {
             $errCtx = Write-DiagnosticError -Source "BLOCKER" -Context "Restore service Automatic" -Target $Svc.Name -ErrorRecord $_
             Add-Log -Badge "[FAILED SERVICE][$appTag] " -Message "$($Svc.Name) - $errCtx" -BadgeColor "Red" -MsgColor "Red" -NoScroll
@@ -4625,12 +4712,10 @@ function Invoke-RestoreUtilitiesGUI {
     foreach ($Item in $targetStartup) {
         $appTag = Get-AppGroupName "$($Item.Name) $($Item.Command)"
         try {
-            if (Test-Path $Item.ApprovedPath) {
-                Set-ItemProperty -Path $Item.ApprovedPath -Name $Item.Name -Value $EnabledBytes -Type Binary -ErrorAction Stop
-                Add-Log -Badge "[ENABLED STARTUP][$appTag] " -Message $Item.Name -BadgeColor "Green" -NoScroll
-            }
+            if (Test-Path $Item.ApprovedPath) { Set-ItemProperty -Path $Item.ApprovedPath -Name $Item.Name -Value $EnabledBytes -Type Binary -ErrorAction Stop }
+            Add-Log -Badge "[ENABLED STARTUP][$appTag] " -Message $Item.Name -BadgeColor "Green" -NoScroll
         } catch {
-            $errCtx = Write-DiagnosticError -Source "BLOCKER" -Context "Enable startup Run entry" -Target "$($Item.RunPath)\$($Item.Name)" -ErrorRecord $_
+            $errCtx = Write-DiagnosticError -Source "BLOCKER" -Context "Restore startup Run entry" -Target "$($Item.RunPath)\$($Item.Name)" -ErrorRecord $_
             Add-Log -Badge "[FAILED STARTUP][$appTag] " -Message "$($Item.Name) - $errCtx" -BadgeColor "Red" -MsgColor "Red" -NoScroll
         }
     }
@@ -4648,243 +4733,327 @@ function Invoke-RestoreUtilitiesGUI {
     foreach ($Task in $targetTasks) {
         $appTag = Get-AppGroupName "$($Task.TaskPath)$($Task.TaskName)"
         try {
-            if ($Task.State -eq "Disabled") {
-                Enable-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -ErrorAction Stop | Out-Null
-                Add-Log -Badge "[ENABLED TASK][$appTag] " -Message "$($Task.TaskPath)$($Task.TaskName)" -BadgeColor "Green" -NoScroll
-            }
+            Enable-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -ErrorAction Stop | Out-Null
+            Add-Log -Badge "[ENABLED TASK][$appTag] " -Message "$($Task.TaskPath)$($Task.TaskName)" -BadgeColor "Green" -NoScroll
         } catch {
-            $errCtx = Write-DiagnosticError -Source "BLOCKER" -Context "Enable scheduled task" -Target "$($Task.TaskPath)$($Task.TaskName)" -ErrorRecord $_
+            $errCtx = Write-DiagnosticError -Source "BLOCKER" -Context "Restore scheduled task" -Target "$($Task.TaskPath)$($Task.TaskName)" -ErrorRecord $_
             Add-Log -Badge "[FAILED TASK][$appTag] " -Message "$($Task.TaskName) - $errCtx" -BadgeColor "Red" -MsgColor "Red" -NoScroll
         }
     }
 }
 
+# --- EVENT HANDLERS ---
 $BtnCopyBugReport.Add_Click({
     try {
         Copy-BugReportToClipboard -FallbackTitle $TxtLogHeader.Text
-        [System.Windows.MessageBox]::Show(
-            "Bug report copied to clipboard! Paste it directly to GS.",
-            "ZeroHook Bug Report",
-            [System.Windows.MessageBoxButton]::OK,
-            [System.Windows.MessageBoxImage]::Information
-        ) | Out-Null
+        $origText = $BtnCopyBugReport.Content
+        $BtnCopyBugReport.Content = "Copied!"
+        $BtnCopyBugReport.Foreground = $BrushCyan
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 700
+        $BtnCopyBugReport.Content = $origText
+        $BtnCopyBugReport.Foreground = $BrushGreen
     } catch {
-        $errCtx = Write-DiagnosticError -Source "CLIPBOARD" -Context "Copy bug report" -Target "Clipboard" -ErrorRecord $_ -ForceTrim
-        [System.Windows.MessageBox]::Show("Failed to copy bug report:`n$errCtx", "ZeroHook Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+        [System.Windows.MessageBox]::Show("Could not copy diagnostic log to clipboard: $($_.Exception.Message)", "ZeroHook Error") | Out-Null
     }
 })
-$BtnDebugMode.Add_Click({ Invoke-RelaunchDebugMode })
-$BtnAboutInfo.Add_Click({ Show-AboutInfoWindow })
-$BtnRefresh.Add_Click({
-    Write-DiagnosticLog -Level "INFO" -Source "UI" -Message "Refresh Status clicked."
-    $null = Get-InstalledStoreGames -Refresh
-    Refresh-HookProcessList
-    Update-Dashboard -Filter "ALL"
+
+if ($BtnDebugMode) {
+    $BtnDebugMode.Add_Click({
+        $msg = if ($DebugLog) {
+            "Debug Mode (-DebugLog) is currently ACTIVE.`n`nDo you want to relaunch a fresh Debug Mode session?"
+        } else {
+            "Relaunch ZeroHook with -DebugLog enabled so verbose diagnostic traces are captured in the log for bug reports?"
+        }
+        $ans = [System.Windows.MessageBox]::Show($msg, "ZeroHook Debug Mode", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+        if ($ans -eq [System.Windows.MessageBoxResult]::Yes) {
+            Invoke-RelaunchDebugMode
+        }
+    })
+}
+
+$BtnAboutInfo.Add_Click({
+    Write-DiagnosticLog -Level "DEBUG" -Source "UI" -Message "Opened 'What It Blocks / Info' window."
+    Show-AboutInfoWindow
 })
 
-$CardTask.Add_Click({ Write-DiagnosticLog -Level "DEBUG" -Source "UI" -Message "CardTask clicked."; Update-Dashboard -Filter "TASK" })
-$CardDlls.Add_Click({ Write-DiagnosticLog -Level "DEBUG" -Source "UI" -Message "CardDlls clicked."; Update-Dashboard -Filter "DLLS" })
-$CardVulkan.Add_Click({ Write-DiagnosticLog -Level "DEBUG" -Source "UI" -Message "CardVulkan clicked."; Update-Dashboard -Filter "VULKAN" })
-$CardServices.Add_Click({ Write-DiagnosticLog -Level "DEBUG" -Source "UI" -Message "CardServices clicked."; Update-Dashboard -Filter "SERVICES" })
-$CardStartup.Add_Click({ Write-DiagnosticLog -Level "DEBUG" -Source "UI" -Message "CardStartup clicked."; Update-Dashboard -Filter "STARTUP" })
-$CardLaunchers.Add_Click({ Write-DiagnosticLog -Level "DEBUG" -Source "UI" -Message "CardLaunchers clicked."; Update-Dashboard -Filter "LAUNCHERS" })
+$CardTask.Add_Click({ Render-FilteredLog "TASK" })
+$CardDlls.Add_Click({ Render-FilteredLog "DLLS" })
+$CardVulkan.Add_Click({ Render-FilteredLog "VULKAN" })
+$CardServices.Add_Click({ Render-FilteredLog "SERVICES" })
+$CardStartup.Add_Click({ Render-FilteredLog "STARTUP" })
+$CardLaunchers.Add_Click({ Render-FilteredLog "LAUNCHERS" })
 
 $CmbAppFilter.Add_SelectionChanged({
     if ($Script:SuppressFilterEvent) { return }
-    $selApp = if ($CmbAppFilter.SelectedItem) { [string]$CmbAppFilter.SelectedItem } else { "ALL APPS" }
-    Write-DiagnosticLog -Level "DEBUG" -Source "UI" -Message "App filter changed -> '$selApp'"
     Render-FilteredLog -Filter $Script:CurrentCategoryFilter
 })
 
+$BtnRefresh.Add_Click({
+    Write-DiagnosticLog -Level "INFO" -Source "UI" -Message "User clicked Refresh Status."
+    $null = Get-InstalledStoreGames -Refresh
+    Update-Dashboard -Filter $Script:CurrentCategoryFilter
+})
+
 $BtnQuickFilter.Add_Click({
-    Write-DiagnosticLog -Level "INFO" -Source "UI" -Message "Reset Log & Filters clicked."
+    Write-DiagnosticLog -Level "INFO" -Source "UI" -Message "User clicked Reset Log & Filters."
     $Script:SuppressFilterEvent = $true
     $CmbAppFilter.SelectedIndex = 0
     $Script:SuppressFilterEvent = $false
     Update-Dashboard -Filter "ALL"
 })
 
+$BtnBlockAll.Add_Click({
+    $AppFilter = if ($CmbAppFilter.SelectedItem) { [string]$CmbAppFilter.SelectedItem } else { "ALL APPS" }
+    Write-DiagnosticLog -Level "INFO" -Source "UI" -Message "User clicked Block Everything (AppFilter=$AppFilter)."
+
+    if ($AppFilter -ne "ALL APPS") {
+        $Confirm = [System.Windows.MessageBox]::Show(
+            "Block all active items for [$AppFilter] only (respecting your Exclusions List)?",
+            "ZeroHook - Block Filtered App",
+            [System.Windows.MessageBoxButton]::YesNo,
+            [System.Windows.MessageBoxImage]::Question
+        )
+        if ($Confirm -ne [System.Windows.MessageBoxResult]::Yes) { return }
+
+        Clear-Log "ACTIVITY LOG - BLOCKING [$AppFilter] (RESPECTING EXCLUSIONS)"
+        $D = $Script:ScanData
+        if (-not $D -or $D.Count -eq 0) {
+            Update-Dashboard -Filter "NONE"
+            $D = $Script:ScanData
+        }
+
+        $filteredDlls = @($D.Dlls | Where-Object { (Get-AppGroupName "$($_.Name) $($_.FullName)") -eq $AppFilter })
+        $filteredVulkan = @($D.VulkanLayers | Where-Object { (Get-AppGroupName $_.Name) -eq $AppFilter })
+        $filteredServices = @($D.Services | Where-Object { (Get-AppGroupName "$($_.Name) $($_.DisplayName)") -eq $AppFilter })
+        $filteredStartup = @($D.StartupItems | Where-Object { (Get-AppGroupName "$($_.Name) $($_.Command)") -eq $AppFilter })
+        $filteredShortcuts = @($D.Shortcuts | Where-Object { (Get-AppGroupName "$($_.Name) $($_.FullPath)") -eq $AppFilter })
+        $filteredTasks = @($D.VendorTasks | Where-Object { (Get-AppGroupName "$($_.TaskPath)$($_.TaskName)") -eq $AppFilter })
+
+        Invoke-BlockHooksGUI -DllList $filteredDlls -VulkanList $filteredVulkan
+        Invoke-BlockUtilitiesGUI -ServiceList $filteredServices -StartupList $filteredStartup -ShortcutList $filteredShortcuts -TaskList $filteredTasks
+        Add-Log -Badge "`n=== [$AppFilter] BLOCK COMPLETE ===" -BadgeColor "Cyan"
+        Update-Dashboard -Filter "NONE" -ShowSteamTip:($AppFilter -eq "STEAM")
+        return
+    }
+
+    Prompt-CloseLaunchers
+    Clear-Log "ACTIVITY LOG - BLOCKING EVERYTHING (RESPECTING EXCLUSIONS)"
+    Invoke-BlockHooksGUI
+    Invoke-BlockUtilitiesGUI
+    Add-Log -Badge "`n=== BLOCK EVERYTHING COMPLETE ===" -BadgeColor "Cyan"
+    Update-Dashboard -Filter "NONE" -ShowSteamTip
+})
+
 $BtnCustomBlock.Add_Click({
-    Write-DiagnosticLog -Level "INFO" -Source "UI" -Message "Exclusions List clicked."
+    Write-DiagnosticLog -Level "INFO" -Source "UI" -Message "User clicked Exclusions List..."
     Show-ExclusionsDialog
 })
 
-$BtnBlockAll.Add_Click({
-    Write-DiagnosticLog -Level "INFO" -Source "BLOCKER" -Message "Block Everything (Respects Exclusions) started."
-    Clear-Log "ACTIVITY LOG - BLOCKING EVERYTHING (RESPECTING EXCLUSIONS)"
-    Prompt-CloseLaunchers
-    $AllServices = @(Get-Service -ErrorAction SilentlyContinue)
-    $AllTasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue)
-    $Dlls = @(Get-OverlayDLLs)
-    $VulkanLayers = @(Get-VulkanLayersList)
-    $Services = @(Get-UtilityServices -AllServices $AllServices)
-    $StartupItems = @(Get-UtilityStartupItems)
-    $Shortcuts = @(Get-UtilityStartupShortcuts)
-    $VendorTasks = @(Get-UtilityScheduledTasks -AllTasks $AllTasks)
-    Invoke-BlockHooksGUI -DllList $Dlls -VulkanList $VulkanLayers
-    Invoke-BlockUtilitiesGUI -ServiceList $Services -StartupList $StartupItems -ShortcutList $Shortcuts -TaskList $VendorTasks
-    Add-Log -Badge "`n=== BLOCK EVERYTHING COMPLETE ===" -BadgeColor "Cyan"
-    Update-Dashboard -Filter "NONE"
-})
-
 $BtnBlockOverlaysOnly.Add_Click({
-    Write-DiagnosticLog -Level "INFO" -Source "BLOCKER" -Message "Block Overlay Hooks Only started."
-    Clear-Log "ACTIVITY LOG - BLOCKING OVERLAY HOOKS ONLY"
+    Write-DiagnosticLog -Level "INFO" -Source "UI" -Message "User clicked Block Overlay Hooks Only."
     Prompt-CloseLaunchers
-    $Dlls = @(Get-OverlayDLLs)
-    $VulkanLayers = @(Get-VulkanLayersList)
-    Invoke-BlockHooksGUI -DllList $Dlls -VulkanList $VulkanLayers
-    Add-Log -Badge "`n=== OVERLAY BLOCK COMPLETE ===" -BadgeColor "Cyan"
-    Update-Dashboard -Filter "NONE"
+    Clear-Log "ACTIVITY LOG - BLOCKING OVERLAY HOOKS ONLY (RESPECTING EXCLUSIONS)"
+    Invoke-BlockHooksGUI
+    Add-Log -Badge "`n=== OVERLAY HOOKS BLOCKED ===" -BadgeColor "Cyan"
+    Update-Dashboard -Filter "NONE" -ShowSteamTip
 })
 
 $BtnRestoreAll.Add_Click({
-    Write-DiagnosticLog -Level "INFO" -Source "BLOCKER" -Message "Restore Everything (Default Auto-Start) started."
+    $AppFilter = if ($CmbAppFilter.SelectedItem) { [string]$CmbAppFilter.SelectedItem } else { "ALL APPS" }
+    Write-DiagnosticLog -Level "INFO" -Source "UI" -Message "User clicked Restore Everything (AppFilter=$AppFilter)."
+
+    if ($AppFilter -ne "ALL APPS") {
+        $Confirm = [System.Windows.MessageBox]::Show(
+            "Restore all blocked items for [$AppFilter] only back to default auto-start/allowed state?",
+            "ZeroHook - Restore Filtered App",
+            [System.Windows.MessageBoxButton]::YesNo,
+            [System.Windows.MessageBoxImage]::Warning
+        )
+        if ($Confirm -ne [System.Windows.MessageBoxResult]::Yes) { return }
+
+        Clear-Log "ACTIVITY LOG - RESTORING [$AppFilter]"
+        $D = $Script:ScanData
+        if (-not $D -or $D.Count -eq 0) {
+            Update-Dashboard -Filter "NONE"
+            $D = $Script:ScanData
+        }
+
+        $filteredDlls = @($D.Dlls | Where-Object { (Get-AppGroupName "$($_.Name) $($_.FullName)") -eq $AppFilter })
+        $filteredVulkan = @($D.VulkanLayers | Where-Object { (Get-AppGroupName $_.Name) -eq $AppFilter })
+        $filteredServices = @($D.Services | Where-Object { (Get-AppGroupName "$($_.Name) $($_.DisplayName)") -eq $AppFilter })
+        $filteredStartup = @($D.StartupItems | Where-Object { (Get-AppGroupName "$($_.Name) $($_.Command)") -eq $AppFilter })
+        $filteredShortcuts = @($D.Shortcuts | Where-Object { (Get-AppGroupName "$($_.Name) $($_.FullPath)") -eq $AppFilter })
+        $filteredTasks = @($D.VendorTasks | Where-Object { (Get-AppGroupName "$($_.TaskPath)$($_.TaskName)") -eq $AppFilter })
+
+        Invoke-RestoreHooksGUI -DllList $filteredDlls -VulkanList $filteredVulkan
+        Invoke-RestoreUtilitiesGUI -ServiceList $filteredServices -StartupList $filteredStartup -ShortcutList $filteredShortcuts -TaskList $filteredTasks
+        Add-Log -Badge "`n=== [$AppFilter] RESTORE COMPLETE ===" -BadgeColor "Cyan"
+        Update-Dashboard -Filter "NONE"
+        return
+    }
+
+    $Confirm = [System.Windows.MessageBox]::Show(
+        "Are you sure you want to restore all overlay hooks, Vulkan layers, RGB services, and startup apps to default?",
+        "Confirm Restore",
+        [System.Windows.MessageBoxButton]::YesNo,
+        [System.Windows.MessageBoxImage]::Warning
+    )
+    if ($Confirm -ne [System.Windows.MessageBoxResult]::Yes) { return }
     Clear-Log "ACTIVITY LOG - RESTORING EVERYTHING"
-    $AllServices = @(Get-Service -ErrorAction SilentlyContinue)
-    $AllTasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue)
-    $Dlls = @(Get-OverlayDLLs)
-    $VulkanLayers = @(Get-VulkanLayersList)
-    $Services = @(Get-UtilityServices -AllServices $AllServices)
-    $StartupItems = @(Get-UtilityStartupItems)
-    $Shortcuts = @(Get-UtilityStartupShortcuts)
-    $VendorTasks = @(Get-UtilityScheduledTasks -AllTasks $AllTasks)
-    Invoke-RestoreHooksGUI -DllList $Dlls -VulkanList $VulkanLayers
-    Invoke-RestoreUtilitiesGUI -ServiceList $Services -StartupList $StartupItems -ShortcutList $Shortcuts -TaskList $VendorTasks
+    Invoke-RestoreHooksGUI
+    Invoke-RestoreUtilitiesGUI
     Add-Log -Badge "`n=== RESTORE COMPLETE ===" -BadgeColor "Cyan"
     Update-Dashboard -Filter "NONE"
 })
 
 $BtnToggleTask.Add_Click({
+    Write-DiagnosticLog -Level "INFO" -Source "UI" -Message "User clicked Toggle Auto-Run at Startup."
+    Clear-Log "ACTIVITY LOG - TASK SCHEDULER"
     $Existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($Existing) {
         try {
             Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
-            Write-DiagnosticLog -Level "INFO" -Source "TASK" -Message "Removed scheduled task '$TaskName'." -ForceTrim
-            Clear-Log "ACTIVITY LOG - STARTUP AUTO-BLOCK TASK"
-            Add-Log -Badge "[TASK REMOVED] " -Message "Scheduled task '$TaskName' deleted." -BadgeColor "Yellow"
+            Write-DiagnosticLog -Level "INFO" -Source "TASK" -Message "Removed startup task '$TaskName'." -ForceTrim
+            Add-Log -Badge "[REMOVED] " -Message "Startup Task '$TaskName' deleted." -BadgeColor "Yellow" -NoScroll
         } catch {
             $errCtx = Write-DiagnosticError -Source "TASK" -Context "Unregister scheduled task" -Target $TaskName -ErrorRecord $_ -ForceTrim
-            Clear-Log "ACTIVITY LOG - STARTUP AUTO-BLOCK TASK"
-            Add-Log -Badge "[TASK ERROR] " -Message "Failed to remove scheduled task '$TaskName': $errCtx" -BadgeColor "Red" -MsgColor "Red"
+            Add-Log -Badge "[FAILED] " -Message "Could not remove task: $errCtx" -BadgeColor "Red" -MsgColor "Red" -NoScroll
         }
     } else {
         try {
-            $hostInfo = Get-HostRuntimeInfo
-            if ($hostInfo.IsPortableExe) {
-                $ExeTarget = $hostInfo.ExePath
-                $Action = New-ScheduledTaskAction -Execute $ExeTarget -Argument "-AutoBlock" -WorkingDirectory ([IO.Path]::GetDirectoryName($ExeTarget))
+            $TargetExecutable = Save-LocalScriptCopy
+            if ($TargetExecutable -match '(?i)\.exe$') {
+                $Action = New-ScheduledTaskAction -Execute "`"$TargetExecutable`"" -Argument "-AutoBlock" -WorkingDirectory (Split-Path -Parent $TargetExecutable)
             } else {
-                $ScriptCopy = Save-LocalScriptCopy
-                $PsExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-                $Action = New-ScheduledTaskAction -Execute $PsExe -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptCopy`" -AutoBlock" -WorkingDirectory $LocalInstallDir
+                $PsHostExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+                $Action = New-ScheduledTaskAction -Execute $PsHostExe -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$TargetExecutable`" -AutoBlock" -WorkingDirectory $LocalInstallDir
             }
-            $Trigger = New-ScheduledTaskTrigger -AtLogOn
-            $Trigger.Delay = "PT60S"
-            $Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
+            $TriggerBoot = New-ScheduledTaskTrigger -AtStartup
+            $TriggerBoot.Delay = "PT60S"
+            $TriggerLogon = New-ScheduledTaskTrigger -AtLogOn
+            $TriggerLogon.Delay = "PT60S"
+            $Principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" -LogonType ServiceAccount -RunLevel Highest
             $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
-            Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Force -ErrorAction Stop | Out-Null
-            Write-DiagnosticLog -Level "INFO" -Source "TASK" -Message "Registered scheduled task '$TaskName' (60s logon delay, RunLevel=Highest, WorkDir=$(Hide-Username $LocalInstallDir))." -ForceTrim
-            Clear-Log "ACTIVITY LOG - STARTUP AUTO-BLOCK TASK"
-            Add-Log -Badge "[TASK ENABLED] " -Message "Scheduled task '$TaskName' will run 60s after logon." -BadgeColor "Green"
+            $TaskObj = New-ScheduledTask -Action $Action -Trigger @($TriggerBoot, $TriggerLogon) -Principal $Principal -Settings $Settings
+            Register-ScheduledTask -TaskName $TaskName -InputObject $TaskObj -Force -ErrorAction Stop | Out-Null
+            $tDiag = Get-ScheduledTaskDiagInfo
+            Write-DiagnosticLog -Level "INFO" -Source "TASK" -Message "Registered startup task '$TaskName' | Exec=$($tDiag.Execute) | Args=$($tDiag.Arguments) | WorkDir=$($tDiag.WorkingDir)." -ForceTrim
+            Add-Log -Badge "[CREATED] " -Message "Scheduled Task '$TaskName' enabled (runs 60s after Windows Startup & Logon as SYSTEM, respecting Exclusions List)." -BadgeColor "Green" -NoScroll
+            Add-Log -Badge "[EXECUTABLE] " -Message (Hide-Username $TargetExecutable) -BadgeColor "Cyan" -MsgColor "Gray" -NoScroll
+            Add-Log -Badge "[IMPORTANT] " -Message "Keep Steam auto-startup enabled so Steam finishes initializing before the 60s task disables its Vulkan layers." -BadgeColor "Yellow" -MsgColor "Yellow" -NoScroll
         } catch {
             $errCtx = Write-DiagnosticError -Source "TASK" -Context "Register scheduled task" -Target $TaskName -ErrorRecord $_ -ForceTrim
-            Clear-Log "ACTIVITY LOG - STARTUP AUTO-BLOCK TASK"
-            Add-Log -Badge "[TASK ERROR] " -Message "Failed to register scheduled task '$TaskName': $errCtx" -BadgeColor "Red" -MsgColor "Red"
+            Add-Log -Badge "[FAILED] " -Message "Could not create task: $errCtx" -BadgeColor "Red" -MsgColor "Red" -NoScroll
         }
     }
-    Update-Dashboard -Filter "TASK"
+    Update-Dashboard -Filter "NONE"
 })
 
-$BtnReloadProcs.Add_Click({
-    Write-DiagnosticLog -Level "DEBUG" -Source "LIVEHOOK" -Message "Reload Processes clicked."
-    Refresh-HookProcessList
-})
-
+# --- TAB 2 (LIVE DLL HOOKS) EVENTS ---
 $CmbHookProcess.Add_SelectionChanged({
     if ($Script:SuppressHookProcessSelection) { return }
-    $selTarget = Get-SelectedHookTarget
-    if ($selTarget) {
-        $Script:LiveHookTarget = $selTarget
-        $Script:SeenModuleKeys.Clear()
-        $Script:PendingHookDetections.Clear()
-        $TxtLiveHookStatus.Text = "SELECTED: $($selTarget.Name) (PID $($selTarget.Id))"
+    $HookTimer.Stop()
+    $BtnToggleLiveMonitor.Content = "Start Real-Time Watch"
+    $BtnToggleLiveMonitor.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#22A055")
+    $Script:LiveHookTarget = Get-SelectedHookTarget
+    $Script:LastHookSnapshot = $null
+    $Script:LastHookTargetInfo = $null
+    $Script:SeenModuleKeys.Clear()
+    $Script:PendingHookDetections.Clear()
+    $HookLogBox.Document.Blocks.Clear()
+    if ($Script:LiveHookTarget) {
+        $TxtLiveHookStatus.Text = "SELECTED: $($Script:LiveHookTarget.Name) (PID $($Script:LiveHookTarget.Id))"
         $TxtLiveHookStatus.Foreground = $BrushCyan
-        Write-DiagnosticLog -Level "INFO" -Source "LIVEHOOK" -Message "Selected target process: $($selTarget.Name) (PID $($selTarget.Id)) | Path=$(Hide-Username $selTarget.Path)"
+        Write-DiagnosticLog -Level "INFO" -Source "LIVEHOOK" -Message "Selected target process: $($Script:LiveHookTarget.Name) (PID $($Script:LiveHookTarget.Id))."
         Invoke-HookMonitorStep -ForceLogSnapshot
     }
 })
 
+$BtnReloadProcs.Add_Click({
+    Write-DiagnosticLog -Level "DEBUG" -Source "LIVEHOOK" -Message "User clicked Reload Processes."
+    Refresh-HookProcessList
+})
+
 $BtnLockForeground.Add_Click({
-    Write-DiagnosticLog -Level "INFO" -Source "LIVEHOOK" -Message "Lock Foreground (3s) started."
-    $BtnLockForeground.IsEnabled = $false
-    $TxtLiveHookStatus.Text = "LOCKING IN 3s... Switch to your game window now!"
-    $TxtLiveHookStatus.Foreground = $BrushYellow
-    [System.Windows.Forms.Application]::DoEvents()
-
-    for ($i = 3; $i -ge 1; $i--) {
-        $TxtLiveHookStatus.Text = "LOCKING IN ${i}s... Switch to your game window now!"
-        Start-Sleep -Seconds 1
-        [System.Windows.Forms.Application]::DoEvents()
-    }
-
     try {
         Ensure-ForegroundWin32
-        $fgPid = [ZeroHook.Win32Foreground]::GetForegroundPid()
-        if ($fgPid -gt 0 -and $fgPid -ne $PID) {
-            $p = Get-Process -Id $fgPid -ErrorAction Stop
-            if ($p.ProcessName -notin $IgnoredForegroundProcesses) {
-                $Script:LiveHookTarget = [PSCustomObject]@{
-                    Id         = [int]$p.Id
-                    Name       = [string]$p.ProcessName
-                    Path       = $(try { [string]$p.Path } catch { "" })
-                    StartedUtc = $(try { $p.StartTime.ToUniversalTime() } catch { $null })
-                }
-                $Script:SeenModuleKeys.Clear()
-                $Script:PendingHookDetections.Clear()
-                Refresh-HookProcessList
-                $matchedIdx = -1
-                for ($idx = 0; $idx -lt $CmbHookProcess.Items.Count; $idx++) {
-                    $it = $CmbHookProcess.Items[$idx]
-                    if ($it.Tag -and [int]$it.Tag.Id -eq [int]$p.Id) { $matchedIdx = $idx; break }
-                }
-                if ($matchedIdx -ge 0) {
-                    $Script:SuppressHookProcessSelection = $true
-                    $CmbHookProcess.SelectedIndex = $matchedIdx
-                    $Script:SuppressHookProcessSelection = $false
-                }
-                $p.Dispose()
-                Write-DiagnosticLog -Level "INFO" -Source "LIVEHOOK" -Message "Locked onto foreground process: $($Script:LiveHookTarget.Name) (PID $($Script:LiveHookTarget.Id))"
-                Invoke-HookMonitorStep -ForceLogSnapshot
-            } else {
-                $p.Dispose()
-                $TxtLiveHookStatus.Text = "IGNORED WINDOW ($($p.ProcessName)) - Focus the game window and retry"
-                $TxtLiveHookStatus.Foreground = $BrushYellow
-                Write-DiagnosticLog -Level "WARN" -Source "LIVEHOOK" -Message "Foreground lock hit ignored process: PID=$fgPid"
-            }
-        } else {
-            $TxtLiveHookStatus.Text = "NO GAME WINDOW DETECTED - Click inside the game and retry"
-            $TxtLiveHookStatus.Foreground = $BrushYellow
-            Write-DiagnosticLog -Level "WARN" -Source "LIVEHOOK" -Message "Foreground lock found no valid target window (fgPid=$fgPid)."
+        $BtnLockForeground.IsEnabled = $false
+        $BtnLockForeground.Content = "Switch to Game (3s)..."
+        $TxtLiveHookStatus.Text = "COUNTDOWN - Focus your game window within 3 seconds..."
+        $TxtLiveHookStatus.Foreground = $BrushYellow
+        Write-DiagnosticLog -Level "INFO" -Source "LIVEHOOK" -Message "Started 3s foreground window lock countdown."
+        [System.Windows.Forms.Application]::DoEvents()
+
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($sw.ElapsedMilliseconds -lt 3000) {
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 100
         }
+
+        $fgPid = [ZeroHook.Win32Foreground]::GetForegroundPid()
+        if ($fgPid -le 0 -or $fgPid -eq $PID) {
+            $TxtLiveHookStatus.Text = "LOCK FAILED - Could not capture a game foreground window"
+            $TxtLiveHookStatus.Foreground = $BrushRed
+            Write-DiagnosticLog -Level "WARN" -Source "LIVEHOOK" -Message "Foreground lock failed (fgPid=$fgPid)."
+            return
+        }
+
+        $p = Get-Process -Id $fgPid -ErrorAction Stop
+        $pName = [string]$p.ProcessName
+        $pPath = try { [string]$p.Path } catch { "" }
+        $pStart = try { $p.StartTime.ToUniversalTime() } catch { $null }
+        $p.Dispose()
+
+        $Script:LiveHookTarget = [PSCustomObject]@{
+            Id = [int]$fgPid; Name = $pName; Path = $pPath; StartedUtc = $pStart
+        }
+        $Script:LastHookSnapshot = $null
+        $Script:LastHookTargetInfo = $null
+        $Script:SeenModuleKeys.Clear()
+        $Script:PendingHookDetections.Clear()
+        $HookLogBox.Document.Blocks.Clear()
+        Refresh-HookProcessList
+
+        $Script:SuppressHookProcessSelection = $true
+        try {
+            $matched = $false
+            for ($i = 0; $i -lt $CmbHookProcess.Items.Count; $i++) {
+                if ($CmbHookProcess.Items[$i].Tag.Id -eq $fgPid) {
+                    $CmbHookProcess.SelectedIndex = $i
+                    $matched = $true
+                    break
+                }
+            }
+            if (-not $matched) {
+                $newItem = New-Object System.Windows.Controls.ComboBoxItem
+                $newItem.Content = "$pName (PID $fgPid)"
+                $newItem.Tag = [PSCustomObject]@{ Id = [int]$fgPid; Name = $pName; Path = $pPath }
+                [void]$CmbHookProcess.Items.Add($newItem)
+                $CmbHookProcess.SelectedItem = $newItem
+            }
+        } finally {
+            $Script:SuppressHookProcessSelection = $false
+        }
+
+        Write-DiagnosticLog -Level "INFO" -Source "LIVEHOOK" -Message "Locked foreground process: $pName (PID $fgPid) | Path=$(Hide-Username $pPath)"
+        Add-HookLog -Badge "[LOCKED TARGET] " -Message "$pName (PID $fgPid)" -BadgeColor "Green" -SkipDiagLog -NoScroll
+        Invoke-HookMonitorStep -ForceLogSnapshot
     } catch {
-        $errCtx = Write-DiagnosticError -Source "LIVEHOOK" -Context "Lock foreground window" -Target "ForegroundWindow" -ErrorRecord $_
-        $TxtLiveHookStatus.Text = "FOREGROUND LOCK FAILED: $errCtx"
+        $errCtx = Write-DiagnosticError -Source "LIVEHOOK" -Context "Foreground lock" -Target "Win32Foreground" -ErrorRecord $_
+        $TxtLiveHookStatus.Text = "LOCK ERROR: $errCtx"
         $TxtLiveHookStatus.Foreground = $BrushRed
     } finally {
+        $BtnLockForeground.Content = "Lock Foreground (3s)"
         $BtnLockForeground.IsEnabled = $true
     }
 })
 
 $CmbPollInterval.Add_SelectionChanged({
-    if ($CmbPollInterval.SelectedItem) {
-        $txt = [string]$CmbPollInterval.SelectedItem
-        if ($txt -match '^(\d+)s$') {
-            $secs = [int]$matches[1]
-            $HookTimer.Interval = [TimeSpan]::FromSeconds($secs)
-            Write-DiagnosticLog -Level "DEBUG" -Source "LIVEHOOK" -Message "Poll interval set to ${secs}s."
-        }
-    }
+    $sec = [int](([string]$CmbPollInterval.SelectedItem) -replace 's', '')
+    if ($sec -lt 1) { $sec = 5 }
+    $HookTimer.Interval = [TimeSpan]::FromSeconds($sec)
+    Write-DiagnosticLog -Level "DEBUG" -Source "LIVEHOOK" -Message "Poll interval changed to ${sec}s."
 })
 
 $BtnToggleLiveMonitor.Add_Click({
@@ -4892,53 +5061,59 @@ $BtnToggleLiveMonitor.Add_Click({
         $HookTimer.Stop()
         $BtnToggleLiveMonitor.Content = "Start Real-Time Watch"
         $BtnToggleLiveMonitor.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#22A055")
-        $TxtLiveHookStatus.Text = "PAUSED - Real-time watch stopped"
+        $TxtLiveHookStatus.Text = "PAUSED"
         $TxtLiveHookStatus.Foreground = $BrushYellow
-        Write-DiagnosticLog -Level "INFO" -Source "LIVEHOOK" -Message "Real-time watch stopped."
+        Write-DiagnosticLog -Level "INFO" -Source "LIVEHOOK" -Message "Real-Time Watch PAUSED."
     } else {
-        $target = Get-SelectedHookTarget
-        if (-not $target) {
-            $TxtLiveHookStatus.Text = "SELECT A PROCESS FIRST - Choose a process or use Lock Foreground (3s)"
-            $TxtLiveHookStatus.Foreground = $BrushRed
+        if (-not $Script:LiveHookTarget) {
+            $Script:LiveHookTarget = Get-SelectedHookTarget
+        }
+        if (-not $Script:LiveHookTarget) {
+            $TxtLiveHookStatus.Text = "Select a process or click Lock Foreground (3s) first"
+            $TxtLiveHookStatus.Foreground = $BrushYellow
             Write-DiagnosticLog -Level "WARN" -Source "LIVEHOOK" -Message "Start Real-Time Watch clicked with no valid target."
             return
         }
-        $Script:LiveHookTarget = $target
+        $HookLogBox.Document.Blocks.Clear()
         $Script:SeenModuleKeys.Clear()
         $Script:PendingHookDetections.Clear()
+        $Script:LastHookSnapshot = $null
+        $Script:LastHookTargetInfo = $null
+        Write-DiagnosticLog -Level "INFO" -Source "LIVEHOOK" -Message "Real-Time Watch STARTED for $($Script:LiveHookTarget.Name) (PID $($Script:LiveHookTarget.Id)) | Interval=$($HookTimer.Interval.TotalSeconds)s."
+        Invoke-HookMonitorStep -ForceLogSnapshot
         $HookTimer.Start()
         $BtnToggleLiveMonitor.Content = "Stop Real-Time Watch"
         $BtnToggleLiveMonitor.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#DC2626")
-        Write-DiagnosticLog -Level "INFO" -Source "LIVEHOOK" -Message "Real-time watch started for $($target.Name) (PID $($target.Id)) at interval $($HookTimer.Interval.TotalSeconds)s."
-        Invoke-HookMonitorStep -ForceLogSnapshot
     }
 })
 
 $BtnScanNowHooks.Add_Click({
-    Write-DiagnosticLog -Level "INFO" -Source "LIVEHOOK" -Message "Scan Snapshot Now clicked."
-    $target = Get-SelectedHookTarget
-    if (-not $target) {
-        $TxtLiveHookStatus.Text = "SELECT A PROCESS FIRST - Choose a process or use Lock Foreground (3s)"
-        $TxtLiveHookStatus.Foreground = $BrushRed
-        return
+    if (-not $Script:LiveHookTarget) {
+        $Script:LiveHookTarget = Get-SelectedHookTarget
     }
-    $Script:LiveHookTarget = $target
+    Write-DiagnosticLog -Level "INFO" -Source "LIVEHOOK" -Message "User clicked Scan Snapshot Now."
     $Script:SeenModuleKeys.Clear()
     $Script:PendingHookDetections.Clear()
+    $Script:LastHookSnapshot = $null
+    $Script:LastHookTargetInfo = $null
+    $HookLogBox.Document.Blocks.Clear()
     Invoke-HookMonitorStep -ForceLogSnapshot
 })
 
 $BtnClearHookLog.Add_Click({
     $HookLogBox.Document.Blocks.Clear()
+    $Script:SeenModuleKeys.Clear()
     $Script:PendingHookDetections.Clear()
-    Write-DiagnosticLog -Level "DEBUG" -Source "LIVEHOOK" -Message "Cleared live hook log."
+    $Script:LastHookSnapshot = $null
+    $Script:LastHookTargetInfo = $null
+    Write-DiagnosticLog -Level "DEBUG" -Source "LIVEHOOK" -Message "User cleared Hook Log."
 })
 
-$Window.Add_Closing({
-    if ($HookTimer -and $HookTimer.IsEnabled) { $HookTimer.Stop() }
-    Write-DiagnosticLog -Level "INFO" -Source "SESSION" -Message "ZeroHook GUI closing | SessionId=$Script:SessionId" -ForceTrim
+$Window.Add_Closed({
+    $HookTimer.Stop()
+    Write-DiagnosticLog -Level "INFO" -Source "SESSION" -Message "ZeroHook GUI closed cleanly." -ForceTrim
 })
 
 Refresh-HookProcessList -SelectFirstSilently
 Update-Dashboard -Filter "ALL"
-$null = $Window.ShowDialog()
+$Window.ShowDialog() | Out-Null
