@@ -1830,7 +1830,7 @@ function Copy-BugReportToClipboard {
 
     $report = @(
         "=== ZeroHook Bug Report ==="
-        "App: ZeroHook (Made by: GS | Build: v.1.0.3)"
+        "App: ZeroHook (Made by: GS | Build: v.1.0.4)"
         "SessionId: $Script:SessionId | RunMode: $($envInfo.Mode)"
         "Section: $FallbackTitle"
         "Timestamp (UTC): $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'))Z"
@@ -2449,7 +2449,7 @@ Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
 
-Write-DiagnosticLog -Level "INFO" -Source "APP" -Message "ZeroHook GUI started (Build: v.1.0.3)."
+Write-DiagnosticLog -Level "INFO" -Source "APP" -Message "ZeroHook GUI started (Build: v.1.0.4)."
 
 function Get-ZeroHookLogo {
     param([string]$ExplicitPath = "")
@@ -2594,7 +2594,7 @@ $ZeroHookLogo = Get-ZeroHookLogo
                 <Image x:Name="ImgHeaderLogo" Width="28" Height="28" Margin="0,0,10,0" VerticalAlignment="Center"
                        RenderOptions.BitmapScalingMode="HighQuality"/>
                 <TextBlock Text="ZeroHook" FontSize="18" FontWeight="Bold" Foreground="#FFFFFF" VerticalAlignment="Center"/>
-                <TextBlock Text="Made by: GS  |  Build: v.1.0.3"
+                <TextBlock Text="Made by: GS  |  Build: v.1.0.4"
                            FontSize="11" Foreground="#71717A" Margin="10,2,0,0" VerticalAlignment="Center"/>
                 <TextBlock Text="- Bloat &amp; Overlay Blocker + Real-Time Game DLL Hook Detector"
                            FontSize="11.5" Foreground="#A1A1AA" Margin="10,1,0,0" VerticalAlignment="Center"/>
