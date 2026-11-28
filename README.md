@@ -145,3 +145,22 @@ User and computer names are masked in reports. Please check the file yourself be
 - **Anti-cheat & launchers:** changing permissions on launcher or overlay DLLs can, in rare cases, trigger launcher integrity checks, anti-cheat warnings or crashes in some online games. If a game misbehaves, restore that app's DLLs with **Restore Selected...** and add them to the Exclusions List.
 - **Service side effects:** stopping vendor services can pause RGB sync, fan/pump curves, peripheral macros or cloud sync (OneDrive, Dropbox) until they're restored. Use the **RGB control** or **Controller / gamepad** presets in the Exclusions List to keep them running.
 - **Fully auditable:** everything runs from the single `ZeroHook.ps1` script in this repository. Read it before you run it.
+
+---
+
+## Code Signing Policy
+
+Windows releases (`ZeroHook.exe`) are built from this repository by GitHub Actions ([release workflow](.github/workflows/release.yml)) from the tagged source, so the exe always matches the code you can read here. Each release also attaches `ZeroHook.ps1` and shows the SHA-256 of both files.
+
+Free code signing provided by [SignPath.io](https://signpath.io), certificate by [SignPath Foundation](https://signpath.org). *(Applies once the project is accepted into the SignPath Foundation program; until then releases are unsigned.)*
+
+| Role | Who |
+|---|---|
+| Committers and reviewers | GS ([GS-ZeroHook](https://github.com/GS-ZeroHook)) |
+| Approvers | GS ([GS-ZeroHook](https://github.com/GS-ZeroHook)) |
+
+Every signed release is approved by hand before it is signed.
+
+### Privacy
+
+ZeroHook does not collect or send personal data. When you open it, it asks GitHub (`api.github.com`) whether a newer release of this repository exists; nothing about you or your PC is sent. You can turn this off by unticking **Check for updates on start** (bottom right); ZeroHook then contacts GitHub only when you click **Check for updates**. Updates are downloaded only from this repository's Releases, and only after you agree (or after you tick **Install updates automatically**). Bug reports and system scans are saved on your PC and are only shared if you send them yourself.

@@ -1,0 +1,105 @@
+# Builds ZeroHook.exe on GitHub's Windows machines whenever a version tag is pushed
+# (for example v1.1.2 or v1.1.2-beta1), signs it with SignPath once that is set up,
+# and creates a draft GitHub release with ZeroHook.exe and ZeroHook.ps1 attached.
+# Review the draft, write the release notes, then press Publish.
+#
+# SignPath signing runs only when the repository variable SIGNPATH_ORGANIZATION_ID is set
+# (Settings > Secrets and variables > Actions). Until then the release gets an unsigned exe.
+name: Build release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v4
+
+      - name: Check the tag matches the version in ZeroHook.ps1
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: powershell
+        run: |
+          $c = Get-Content -LiteralPath ZeroHook.ps1 -Raw
+          if ($c -notmatch '\$AppVersion\s*=\s*"([^"]+)"') { throw "Could not find `$AppVersion in ZeroHook.ps1" }
+          $version = $Matches[1]
+          $pre = if ($c -match '\$AppPreRelease\s*=\s*"([^"]*)"') { $Matches[1] } else { "" }
+          $expected = "v$version" + $(if ($pre) { "-$pre" } else { "" })
+          if ('${{ github.ref_name }}' -ne $expected) {
+            throw "Tag ${{ github.ref_name }} does not match ZeroHook.ps1 (expected tag $expected). Fix the version or the tag."
+          }
+          Write-Host "Building ZeroHook $expected"
+
+      - name: Install PS2EXE
+        shell: powershell
+        run: |
+          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module ps2exe -Scope CurrentUser -Force
+
+      - name: Build ZeroHook.exe
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path out -Force | Out-Null
+          .\Build-ZeroHook.ps1 -OutputFile (Join-Path $PWD 'out\ZeroHook.exe')
+
+      - name: Upload the unsigned exe
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZeroHook-unsigned
+          path: out/ZeroHook.exe
+
+      - name: Sign with SignPath
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+
+      - name: Collect release files
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          $exe = if (Test-Path -LiteralPath 'signed\ZeroHook.exe') { 'signed\ZeroHook.exe' } else { 'out\ZeroHook.exe' }
+          Copy-Item -LiteralPath $exe -Destination 'release\ZeroHook.exe'
+          Copy-Item -LiteralPath 'ZeroHook.ps1' -Destination 'release\ZeroHook.ps1'
+          $sig = Get-AuthenticodeSignature -LiteralPath 'release\ZeroHook.exe'
+          Write-Host "Signature: $($sig.Status) $($sig.SignerCertificate.Subject)"
+          Get-FileHash -LiteralPath 'release\ZeroHook.exe', 'release\ZeroHook.ps1' -Algorithm SHA256 | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Upload the release files (manual runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZeroHook-build
+          path: release/
+
+      - name: Create a draft release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          name: ZeroHook ${{ github.ref_name }}
+          # Write the release notes above this line before publishing. SignPath requires the
+          # code signing policy link on download pages, so it is added to every release.
+          body: |
+
+
+            ---
+            Code signing policy: https://github.com/${{ github.repository }}#code-signing-policy
+          files: |
+            release/ZeroHook.exe
+            release/ZeroHook.ps1
